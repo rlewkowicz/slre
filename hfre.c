@@ -55,7 +55,7 @@ static inline int is_ascii_letter(int c) {
  * (always >= 1 if max > 0; 0 if max == 0). Returns the code point, or
  * -1 if the bytes don't form valid UTF-8 (in which case *out_len = 1
  * so callers can re-sync byte-by-byte). */
-static int utf8_decode(const unsigned char *p, int max, int *out_len) {
+static inline int utf8_decode(const unsigned char *p, int max, int *out_len) {
   if (max <= 0) { *out_len = 0; return -1; }
   unsigned c0 = p[0];
   if (c0 < 0x80) { *out_len = 1; return (int) c0; }
@@ -1349,10 +1349,15 @@ static int sclass_match(const struct sclass *c, int flags,
       raw = sclass_byte_raw(c, (unsigned char) folded);
     }
   }
-  for (int i = 0; i < UPROP_COUNT; i++) {
-    uint64_t bit = 1ull << i;
-    if ((c->prop_pos & bit) && unicode_prop_match(i, cp)) raw = 1;
-    if ((c->prop_neg & bit) && !unicode_prop_match(i, cp)) raw = 1;
+  /* Skip the property loop entirely when the class has no Unicode
+   * property tests — that's the common case for byte-level classes
+   * like \s, \S, [a-z], [0-9], etc. */
+  if ((c->prop_pos | c->prop_neg) != 0) {
+    for (int i = 0; i < UPROP_COUNT; i++) {
+      uint64_t bit = 1ull << i;
+      if ((c->prop_pos & bit) && unicode_prop_match(i, cp)) raw = 1;
+      if ((c->prop_neg & bit) && !unicode_prop_match(i, cp)) raw = 1;
+    }
   }
   return c->inverted ? !raw : raw;
 }
@@ -3403,6 +3408,149 @@ static void add_thread(struct execstate *es, struct threadlist *l,
 }
 
 /*
+ * Fast Pike VM for programs that don't use OP_LIT. All threads in
+ * clist share the global sp (they advance by rune_len per outer
+ * step), so we decode the rune once instead of once per thread, and
+ * dedupe by (pc, gen) which is sufficient when all threads are at
+ * the same sp. Empirically this is ~2x faster than the per-thread-sp
+ * path on capture-heavy patterns like the HTTP request line.
+ *
+ * Programs that contain OP_LIT (literal byte runs) need per-thread
+ * sp because OP_LIT can advance multiple bytes in one VM step,
+ * desynchronizing threads from each other. Those callers fall
+ * through to run_pike_general below.
+ */
+static int run_pike_global_sp(struct hfre *re, const unsigned char *buf,
+                              int buf_len, int start_off,
+                              int *out_caps, int *out_match_start) {
+  int code_len = re->code_len;
+  int stride = re->n_save_slots;
+
+  struct thread *ct = (struct thread *) re->vm_clist;
+  struct thread *nt = (struct thread *) re->vm_nlist;
+  int *cap_pool_a = re->vm_pool_a;
+  int *cap_pool_b = re->vm_pool_b;
+  int *seen_gen = re->vm_seen_gen;
+  int *best_caps = re->vm_best_caps;
+  memset(seen_gen, 0, (size_t) code_len * sizeof(int));
+  struct threadlist clist = { ct, 0 };
+  struct threadlist nlist = { nt, 0 };
+
+  struct execstate es;
+  es.re = re;
+  es.buf = buf;
+  es.buf_len = buf_len;
+  es.cap_pool = cap_pool_a;
+  es.cap_pool_used = 0;
+  es.cap_pool_cap = re->vm_max_per_step * stride;
+  es.cap_stride = stride;
+  es.seen_gen = seen_gen;
+  es.gen = 1;
+  es.max_threads = re->vm_max_per_step;
+  es.failed = 0;
+
+  int has_match = 0;
+  int best_end = -1;
+  int best_start = -1;
+
+  int *seed = cap_alloc(&es);
+  if (seed == NULL) return HFRE_INTERNAL_ERROR;
+  cap_init(seed, stride);
+  add_thread(&es, &clist, 0, seed, start_off);
+  if (es.failed) return HFRE_INTERNAL_ERROR;
+
+  int sp = start_off;
+  while (clist.n > 0) {
+    /* Decode one rune at the shared sp. */
+    int rune_len = 0;
+    int cp = -1;
+    if (sp < buf_len) {
+      cp = utf8_decode(buf + sp, buf_len - sp, &rune_len);
+      if (rune_len <= 0) rune_len = 1;
+    }
+
+    es.cap_pool = (es.cap_pool == cap_pool_a) ? cap_pool_b : cap_pool_a;
+    es.cap_pool_used = 0;
+    es.gen++;
+    nlist.n = 0;
+
+    for (int ti = 0; ti < clist.n; ti++) {
+      struct thread th = clist.t[ti];
+      struct insn ins = re->code[th.pc];
+
+      if (ins.op == OP_MATCH) {
+        has_match = 1;
+        best_end = sp;
+        best_start = th.caps[0] >= 0 ? th.caps[0] : start_off;
+        cap_copy(best_caps, th.caps, stride);
+        break;
+      }
+      if (cp < 0) continue;
+
+      int matched = 0;
+      switch (ins.op) {
+        case OP_RUNE:
+          matched = (cp == ins.a);
+          break;
+        case OP_RUNE_CI:
+          matched = (unicode_simple_fold(cp) == ins.a);
+          break;
+        case OP_CLASS:
+          matched = sclass_match(&re->classes[ins.a], re->flags, cp,
+                                 (unsigned char) buf[sp]);
+          break;
+        case OP_UPROP:
+          matched = unicode_prop_match(ins.a, cp);
+          if (ins.b) matched = !matched;
+          break;
+        case OP_ANY:
+          matched = 1;
+          break;
+        default:
+          break;
+      }
+      if (matched) {
+        int *new_caps = cap_alloc(&es);
+        if (new_caps == NULL) return HFRE_INTERNAL_ERROR;
+        cap_copy(new_caps, th.caps, stride);
+        add_thread(&es, &nlist, th.pc + 1, new_caps, sp + rune_len);
+        if (es.failed) return HFRE_INTERNAL_ERROR;
+      }
+    }
+
+    {
+      struct thread *tmp = clist.t;
+      clist.t = nlist.t;
+      nlist.t = tmp;
+      clist.n = nlist.n;
+      nlist.n = 0;
+    }
+
+    if (rune_len == 0) break;
+    sp += rune_len;
+  }
+
+  if (!has_match) {
+    for (int ti = 0; ti < clist.n; ti++) {
+      if (re->code[clist.t[ti].pc].op == OP_MATCH) {
+        has_match = 1;
+        best_end = sp;
+        best_start = clist.t[ti].caps[0] >= 0 ? clist.t[ti].caps[0] : start_off;
+        cap_copy(best_caps, clist.t[ti].caps, stride);
+        break;
+      }
+    }
+  }
+
+  if (has_match) {
+    if (out_caps != NULL) cap_copy(out_caps, best_caps, stride);
+    if (out_match_start != NULL) *out_match_start = best_start;
+    return best_end;
+  }
+  return HFRE_NO_MATCH;
+}
+
+/*
  * Run the Pike VM starting at byte offset start_off. On success
  * returns the end byte offset and writes capture pairs (pairs of
  * (start, end) byte offsets) into out_caps. On no match returns
@@ -3411,6 +3559,10 @@ static void add_thread(struct execstate *es, struct threadlist *l,
 static int run_pike(struct hfre *re, const unsigned char *buf,
                     int buf_len, int start_off,
                     int *out_caps, int *out_match_start) {
+  if (!re->has_litop) {
+    return run_pike_global_sp(re, buf, buf_len, start_off,
+                              out_caps, out_match_start);
+  }
   int code_len = re->code_len;
   int stride = re->n_save_slots;
 
