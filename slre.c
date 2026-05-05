@@ -74,8 +74,15 @@ struct regex_info {
 };
 
 static int is_metacharacter(const unsigned char *s) {
-  static const char *metacharacters = "^$().[]*+?|\\Ssdbfnrtv";
-  return strchr(metacharacters, *s) != NULL;
+  switch (*s) {
+    case '^': case '$': case '(': case ')': case '.': case '[': case ']':
+    case '*': case '+': case '?': case '|': case '\\':
+    case 'S': case 's': case 'd': case 'b': case 'f':
+    case 'n': case 'r': case 't': case 'v':
+      return 1;
+    default:
+      return 0;
+  }
 }
 
 static int op_len(const char *re) {
@@ -319,9 +326,53 @@ static int doh(const char *s, int s_len, struct regex_info *info, int bi) {
 }
 
 static int baz(const char *s, int s_len, struct regex_info *info) {
-  int i, result = -1, is_anchored = info->brackets[0].ptr[0] == '^';
+  int i, result = -1;
+  const char *re = info->brackets[0].ptr;
+  int re_len = info->brackets[0].len;
+  int is_anchored = re_len > 0 && re[0] == '^';
+  int icase = info->flags & SLRE_IGNORE_CASE;
+
+  /*
+   * Literal-prefix fast-path: if the regex begins with a plain literal
+   * byte that is not optional (no following '?' or '*'), and there are
+   * no top-level alternations, then any successful match must start at
+   * a position whose first byte equals that literal. memchr lets us
+   * skip non-candidate positions in bulk instead of calling doh() at
+   * every offset. Falls back to per-position scan otherwise.
+   */
+  unsigned char fp_byte = 0;
+  int fp_active = 0;
+  if (!is_anchored && info->brackets[0].num_branches == 0 && re_len > 0) {
+    unsigned char c0 = (unsigned char) re[0];
+    int is_literal =
+      c0 != '\\' && c0 != '^' && c0 != '$' && c0 != '.' &&
+      c0 != '(' && c0 != ')' && c0 != '[' && c0 != ']' &&
+      c0 != '*' && c0 != '+' && c0 != '?' && c0 != '|';
+    int next_optional = re_len >= 2 && (re[1] == '?' || re[1] == '*');
+    if (is_literal && !next_optional) {
+      fp_byte = icase ? (unsigned char) tolower(c0) : c0;
+      fp_active = 1;
+    }
+  }
 
   for (i = 0; i <= s_len; i++) {
+    if (fp_active && i < s_len) {
+      const char *p;
+      if (!icase) {
+        p = (const char *) memchr(s + i, fp_byte, (size_t)(s_len - i));
+        if (p == NULL) { result = -1; break; }
+        i = (int) (p - s);
+      } else {
+        const char *q = s + i;
+        const char *end = s + s_len;
+        while (q < end &&
+               (unsigned char) tolower((unsigned char) *q) != fp_byte) {
+          q++;
+        }
+        if (q == end) { result = -1; break; }
+        i = (int) (q - s);
+      }
+    }
     result = doh(s + i, s_len - i, info, 0);
     if (result >= 0) {
       result += i;
