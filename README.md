@@ -75,5 +75,4 @@ Cesanta Software. Although the engine, compiler, VMs, prefilters, and
 public API have all been rewritten, the original SLRE was the
 starting point and inspiration, and the unit-test corpus that
 shipped with it remains a useful baseline for regression checking.
-Thanks to Sergey and Cesanta for releasing the original under terms
-that made this work possible.
+Thanks to Sergey and Cesanta for releasing the original 
