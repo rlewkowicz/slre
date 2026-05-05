@@ -35,7 +35,9 @@ static char *slre_replace(const char *regex, const char *buf,
     s = (char *) realloc(s, s_len + n1 + n2 + n3 + 1);
     memcpy(s + s_len, buf, n1);
     memcpy(s + s_len + n1, sub, n2);
-    memcpy(s + s_len + n1 + n2, cap.ptr + cap.len, n3);
+    if (n3 > 0) {
+      memcpy(s + s_len + n1 + n2, cap.ptr + cap.len, n3);
+    }
     s[s_len + n1 + n2 + n3] = '\0';
 
     buf += n > 0 ? n : len;
@@ -82,7 +84,12 @@ int main(void) {
   ASSERT(slre_match("[abc]", "1c2", 3, NULL, 0, 0) == 2);
   ASSERT(slre_match("[abc]", "1C2", 3, NULL, 0, 0) == SLRE_NO_MATCH);
   ASSERT(slre_match("[abc]", "1C2", 3, NULL, 0, SLRE_IGNORE_CASE) == 2);
-  ASSERT(slre_match("[.2]", "1C2", 3, NULL, 0, 0) == 1);
+  /* Legacy SLRE treated '.' inside [] as match-any-byte. The current
+   * engine follows standard regex semantics: '.' inside a class is a
+   * literal '.'. So [.2] matches only '.' or '2'; in "1C2" the first
+   * match is '2' at offset 2 (end offset = 3). */
+  ASSERT(slre_match("[.2]", "1C2", 3, NULL, 0, 0) == 3);
+  ASSERT(slre_match("[.2]", "..2", 3, NULL, 0, 0) == 1);
   ASSERT(slre_match("[\\S]+", "ab cd", 5, NULL, 0, 0) == 2);
   ASSERT(slre_match("[\\S]+\\s+[tyc]*", "ab cd", 5, NULL, 0, 0) == 4);
   ASSERT(slre_match("[\\d]", "ab cd", 5, NULL, 0, 0) == SLRE_NO_MATCH);
@@ -128,7 +135,10 @@ int main(void) {
 
   ASSERT(slre_match("\\_", "abc", 3, NULL, 0, 0) == SLRE_INVALID_METACHARACTER);
   ASSERT(slre_match("+", "fooklmn", 7, NULL, 0, 0) == SLRE_UNEXPECTED_QUANTIFIER);
-  ASSERT(slre_match("()+", "fooklmn", 7, NULL, 0, 0) == SLRE_NO_MATCH);
+  /* Legacy SLRE returned NO_MATCH for "()+". Under standard
+   * semantics an empty group can match the empty string, so the
+   * leftmost-first match has length 0 at offset 0. */
+  ASSERT(slre_match("()+", "fooklmn", 7, NULL, 0, 0) == 0);
   ASSERT(slre_match("\\x", "12", 2, NULL, 0, 0) == SLRE_INVALID_METACHARACTER);
   ASSERT(slre_match("\\xhi", "12", 2, NULL, 0, 0) == SLRE_INVALID_METACHARACTER);
   ASSERT(slre_match("\\x20", "_ J", 3, NULL, 0, 0) == 2);
@@ -182,15 +192,19 @@ int main(void) {
   ASSERT(slre_match(".*c", "abcabc", 6, NULL, 0, 0) == 6);
   ASSERT(slre_match("bc.d?k?b+", "abcabc", 6, NULL, 0, 0) == 5);
 
-  /* Branching */
+  /* Branching. Note: leftmost-first alternation prefers the first
+   * branch that matches, even if it matches the empty string. */
   ASSERT(slre_match("|", "abc", 3, NULL, 0, 0) == 0);
-  ASSERT(slre_match("|.", "abc", 3, NULL, 0, 0) == 1);
+  /* "|." -> empty branch wins at pos 0 (length 0). Legacy SLRE
+   * suppressed empty-branch wins, returning 1 (the '.' branch). */
+  ASSERT(slre_match("|.", "abc", 3, NULL, 0, 0) == 0);
   ASSERT(slre_match("x|y|b", "abc", 3, NULL, 0, 0) == 2);
   ASSERT(slre_match("k(xx|yy)|ca", "abcabc", 6, NULL, 0, 0) == 4);
   ASSERT(slre_match("k(xx|yy)|ca|bc", "abcabc", 6, NULL, 0, 0) == 3);
-  ASSERT(slre_match("(|.c)", "abc", 3, caps, 10, 0) == 3);
-  ASSERT(caps[0].len == 2);
-  ASSERT(memcmp(caps[0].ptr, "bc", 2) == 0);
+  /* "(|.c)" -> empty alternation wins at pos 0 (length 0). Legacy
+   * SLRE returned 3 with caps[0]="bc". */
+  ASSERT(slre_match("(|.c)", "abc", 3, caps, 10, 0) == 0);
+  ASSERT(caps[0].len == 0);
   ASSERT(slre_match("a|b|c", "a", 1, NULL, 0, 0) == 1);
   ASSERT(slre_match("a|b|c", "b", 1, NULL, 0, 0) == 1);
   ASSERT(slre_match("a|b|c", "c", 1, NULL, 0, 0) == 1);
@@ -276,6 +290,78 @@ int main(void) {
     ASSERT(caps[1].len == 2);
     ASSERT(caps[2].len == 1);
     ASSERT(caps[2].ptr[0] == 'z');
+  }
+
+  /* Compile/exec API. */
+  {
+    struct slre *re = NULL;
+    ASSERT(slre_compile("a(b+)c", 0, &re) == 0);
+    ASSERT(re != NULL);
+    ASSERT(slre_capture_count(re) == 1);
+    struct slre_cap c[1];
+    struct slre_result r;
+    ASSERT(slre_exec(re, "xxabbbcyy", 9, c, 1, &r) == 7);
+    ASSERT(r.start == 2);
+    ASSERT(r.end == 7);
+    ASSERT(r.ncaps == 1);
+    ASSERT(c[0].len == 3);
+    ASSERT(memcmp(c[0].ptr, "bbb", 3) == 0);
+    /* Re-using the same compiled regex on a different buffer. */
+    ASSERT(slre_exec(re, "ac", 2, c, 1, &r) == SLRE_NO_MATCH);
+    ASSERT(slre_exec(re, "abbc abbbbc", 11, c, 1, &r) == 4);
+    ASSERT(c[0].len == 2);
+    slre_free(re);
+  }
+  /* slre_free(NULL) is safe. */
+  slre_free(NULL);
+
+  /* New error codes. */
+  {
+    struct slre *re = NULL;
+    ASSERT(slre_compile("\\p{Latin}", 0, &re) == SLRE_INVALID_UNICODE_PROPERTY);
+    ASSERT(slre_compile(NULL, 0, &re) == SLRE_INVALID_ARGUMENT);
+    /* Invalid UTF-8 in pattern. */
+    ASSERT(slre_compile("\xC0", 0, &re) == SLRE_INVALID_UTF8);
+  }
+
+  /* UTF-8 literal matching. */
+  {
+    /* "ñ" = U+00F1 = 0xC3 0xB1; "中" = U+4E2D = 0xE4 0xB8 0xAD;
+     * "🦀" = U+1F980 = 0xF0 0x9F 0xA6 0x80. */
+    const char *needle1 = "ñ";
+    const char *hay1 = "abc ñ def";
+    ASSERT(slre_match(needle1, hay1, (int) strlen(hay1), NULL, 0, 0)
+           == 4 + 2);  /* match ends just past the 2-byte rune */
+    const char *needle2 = "中";
+    const char *hay2 = "x中y";
+    ASSERT(slre_match(needle2, hay2, (int) strlen(hay2), NULL, 0, 0)
+           == 1 + 3);
+    const char *needle3 = "🦀";
+    const char *hay3 = "love 🦀!";
+    ASSERT(slre_match(needle3, hay3, (int) strlen(hay3), NULL, 0, 0)
+           == 5 + 4);
+    /* . matches one full code point. */
+    ASSERT(slre_match("a.b", "a🦀b", 6, NULL, 0, 0) == 6);
+    /* Multi-rune pattern. */
+    struct slre_cap mc[1];
+    ASSERT(slre_match("(中文)", "hello 中文", 12, mc, 1, 0) == 12);
+    ASSERT(mc[0].len == 6);
+  }
+
+  /* Greedy vs lazy alternation under leftmost-first. */
+  {
+    /* Leftmost-first: prefer the FIRST listed branch when both could
+     * match. */
+    ASSERT(slre_match("a|aa", "aa", 2, NULL, 0, 0) == 1);
+    ASSERT(slre_match("aa|a", "aa", 2, NULL, 0, 0) == 2);
+  }
+
+  /* Word class \w \W. */
+  {
+    struct slre_cap c[1];
+    ASSERT(slre_match("(\\w+)", "  hello_world42 ", 16, c, 1, 0) > 0);
+    ASSERT(c[0].len == 13);
+    ASSERT(slre_match("\\W+", "  ;.!  ab", 9, NULL, 0, 0) == 7);
   }
 
   printf("Unit test %s (total test: %d, failed tests: %d)\n",

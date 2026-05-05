@@ -1,0 +1,7 @@
+actionplan.md
+
+# build artifacts
+unit_test
+unit_test_asan
+bench
+*.o
