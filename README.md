@@ -46,20 +46,20 @@ prefer the compiled API.
 
 | Workload                | v1 baseline | hfre_match | hfre_exec | Δ vs v1 baseline |
 | ----------------------- | ----------: | ---------: | --------: | ---------------- |
-| literal needle in 4KB   |      63 990 |      5 318 |     3 878 | 16.5× faster     |
-| HTTP request capture    |       3 002 |      3 855 |     1 561 | 1.9× faster      |
-| [a-z]+ icase 1KB upper  |      23 597 |     61 122 |    16 297 | 1.4× faster      |
-| ^(a*)CONTROL on CONTROL |         197 |      1 592 |       165 | 1.2× faster      |
-| zzz[0-9]+ late in 16KB  |     234 760 |      3 440 |       633 | 371× faster      |
+| literal needle in 4KB   |      63 990 |      3 495 |     2 223 | 28.8× faster     |
+| HTTP request capture    |       3 002 |      3 867 |     1 557 | 1.9× faster      |
+| [a-z]+ icase 1KB upper  |      23 597 |     45 949 |     1 094 | 21.6× faster     |
+| ^(a*)CONTROL on CONTROL |         197 |      1 617 |       165 | 1.2× faster      |
+| zzz[0-9]+ late in 16KB  |     234 760 |      3 470 |       634 | 370× faster      |
 
 Workloads not present in the v1 bench:
 
 | Workload                  | hfre_exec |
 | ------------------------- | --------: |
-| (GET\|POST\|PUT\|DELETE)  |       156 |
-| UTF-8 emoji 🦀            |        34 |
-| [A-Za-z0-9_]+ on words    |       195 |
-| .*error in 8KB log        |        17 |
+| (GET\|POST\|PUT\|DELETE)  |       158 |
+| UTF-8 emoji 🦀            |        18 |
+| [A-Za-z0-9_]+ on words    |        20 |
+| .*error in 8KB log        |        18 |
 | [0-9]+abc in 4KB          |       800 |
 | anchored ^GET             |       103 |
 
