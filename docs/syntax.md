@@ -14,6 +14,10 @@ $       Match end of a buffer
 \n \r \f \v \t \b
         Match the corresponding control character
 \xHH    Match byte with hex value 0xHH (e.g. \x4a)
+\pN \p{Greek}
+        Match a Unicode property or script
+\PN \P{Greek}
+        Match a code point outside a Unicode property or script
 \meta   Match one of the meta characters: ^$().[]*+?|\
 
 +       Match one or more times (greedy)
@@ -26,14 +30,16 @@ x|y     Match x or y (alternation; leftmost-first priority)
 
 [...]   Match any byte from the set. Ranges like [a-z] supported.
         Inside a class, `\d \D \s \S \w \W` expand to their byte
-        sets, and `\xHH` selects a literal byte. `.` is a literal
-        period. The first character may be `^` to negate the set.
+        sets, `\p...` and `\P...` add Unicode property tests, and
+        `\xHH` selects a literal byte. `.` is a literal period.
+        The first character may be `^` to negate the set.
 [^...]  Negated class.
 ```
 
 Non-ASCII literals in the pattern (including emoji) match the same
 UTF-8 byte sequence in the input.
 
-Unicode property classes (`\p{Greek}`, `\PN`, etc.) are reserved for
-a future revision and currently produce
-`SLRE_INVALID_UNICODE_PROPERTY` at compile time.
+Supported Unicode property names are `L`, `N`, `Lu`, `Ll`, `Nd`,
+`Latin`, `Greek`, `Cyrillic`, `Han`, `Hiragana`, and `Katakana`,
+backed by Unicode Character Database 17.0.0 ranges. Matching uses
+code points directly and does not normalize text.

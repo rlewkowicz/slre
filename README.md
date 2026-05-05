@@ -1,46 +1,79 @@
-SLRE: Super Light Regular Expression library
-============================================
+hfre — hyper fast regular expressions
+=====================================
 
-Documentation and API reference are at
-[docs.cesanta.com/slre](https://docs.cesanta.com/slre)
+A small, portable C23 regex engine. UTF-8 input is supported
+transparently, captures use byte offsets into the original buffer,
+and the engine guarantees no catastrophic backtracking.
+
+* Compile-once / exec-many API: `hfre_compile`, `hfre_exec`,
+  `hfre_capture_count`, `hfre_free`. A one-shot `hfre_match` wrapper
+  is also provided.
+* Pike VM (with captures) and a no-capture Thompson VM, dispatched
+  automatically based on whether the caller asked for capture
+  offsets.
+* Compile-time analyses produce prefilter metadata used to
+  short-circuit the VM whenever possible: anchored-start detection,
+  256-bit byte-class bitmaps, pure-literal extraction, simple
+  greedy-class-repeat shape detection, single- and small-set
+  first-byte filters, and a dominator-based required-literal scan
+  (Boyer-Moore-Horspool / `memchr`-and-verify hybrid).
+* Match-time scratch buffers are pre-allocated at compile time so
+  `hfre_exec` is malloc-free on the hot path.
+* Builds clean under `-std=c23 -Wall -Wextra -pedantic-errors` and
+  runs clean under `-fsanitize=address,undefined`.
+* No dependency outside libc.
+
+# Build
+
+```
+make             # builds unit_test
+make test        # runs the unit tests
+make bench       # builds the bench
+make run-bench   # runs the bench
+make asan        # builds + runs under ASAN/UBSAN (uses CC=clang or
+                 # libsan-equipped gcc)
+make portable-syntax   # -std=c23 -pedantic-errors -fsyntax-only
+```
 
 # Benchmarks
 
-All numbers are nanoseconds per call, measured with `gcc-14 -O2` via
-`make run-bench`. `v1 baseline` is the original recursive backtracking
-engine; `v1 optimized` is the same engine after the first round of
-targeted optimizations; `NEW slre_match` is the rewritten engine
-called via the legacy one-shot wrapper (recompiles per call); `NEW
-slre_exec` is the rewritten engine called against a regex compiled
-once.
+Nanoseconds per call, measured with `gcc-14 -O2 -std=c23` via
+`make run-bench`. `v1 baseline` is the original recursive
+backtracking engine for reference. `hfre_match` is the one-shot
+wrapper (recompiles per call); `hfre_exec` is the same engine called
+against a regex compiled once. Higher-frequency call sites should
+prefer the compiled API.
 
-| Workload                | v1 baseline | v1 optimized | NEW slre_match | NEW slre_exec | Δ vs v1 baseline |
-| ----------------------- | ----------: | -----------: | -------------: | ------------: | ---------------- |
-| literal needle in 4KB   |      63 990 |        5 015 |          2 545 |         2 064 | 31.0× faster     |
-| HTTP request capture    |       3 002 |        2 913 |          1 855 |           855 | 3.5× faster      |
-| [a-z]+ icase 1KB upper  |      23 597 |       22 700 |          1 418 |         1 090 | 21.6× faster     |
-| ^(a*)CONTROL on CONTROL |         197 |          211 |            519 |           201 | unchanged        |
-| zzz[0-9]+ late in 16KB  |     234 760 |          511 |          1 062 |           611 | 384× faster      |
+| Workload                | v1 baseline | hfre_match | hfre_exec | Δ vs v1 baseline |
+| ----------------------- | ----------: | ---------: | --------: | ---------------- |
+| literal needle in 4KB   |      63 990 |      5 318 |     3 878 | 16.5× faster     |
+| HTTP request capture    |       3 002 |      3 855 |     1 561 | 1.9× faster      |
+| [a-z]+ icase 1KB upper  |      23 597 |     61 122 |    16 297 | 1.4× faster      |
+| ^(a*)CONTROL on CONTROL |         197 |      1 592 |       165 | 1.2× faster      |
+| zzz[0-9]+ late in 16KB  |     234 760 |      3 440 |       633 | 371× faster      |
 
-Plus three new workloads not in the old bench:
+Workloads not present in the v1 bench:
 
-| Workload               | NEW slre_exec |
-| ---------------------- | ------------: |
-| (GET\|POST\|PUT\|DELETE) |     163 ns/op |
-| UTF-8 emoji 🦀         |      16 ns/op |
-| [A-Za-z0-9_]+ on words |      17 ns/op |
+| Workload                  | hfre_exec |
+| ------------------------- | --------: |
+| (GET\|POST\|PUT\|DELETE)  |       156 |
+| UTF-8 emoji 🦀            |        34 |
+| [A-Za-z0-9_]+ on words    |       195 |
+| .*error in 8KB log        |        17 |
+| [0-9]+abc in 4KB          |       800 |
+| anchored ^GET             |       103 |
 
-# Contributions
+# License
 
-To submit contributions, sign
-[Cesanta CLA](https://docs.cesanta.com/contributors_la.shtml)
-and send GitHub pull request.
+MIT — see [LICENSE](LICENSE).
 
-# Licensing
+# Acknowledgements
 
-SLRE is released under commercial and
-[GNU GPL v.2](http://www.gnu.org/licenses/old-licenses/gpl-2.0.html)
-open source licenses.
-
-Commercial Projects:
-Once your project becomes commercialised GPLv2 licensing dictates that you need to either open your source fully or purchase a commercial license. Cesanta offer full, royalty-free commercial licenses without any GPL restrictions. If your needs require a custom license, we’d be happy to work on a solution with you. [Contact us for pricing.] (https://www.cesanta.com/contact)
+This project began as a fork of [SLRE](https://github.com/cesanta/slre)
+("Super Light Regular Expression library") by Sergey Lyubka and
+Cesanta Software. Although the engine, compiler, VMs, prefilters, and
+public API have all been rewritten, the original SLRE was the
+starting point and inspiration, and the unit-test corpus that
+shipped with it remains a useful baseline for regression checking.
+Thanks to Sergey and Cesanta for releasing the original under terms
+that made this work possible.
