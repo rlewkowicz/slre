@@ -364,6 +364,63 @@ int main(void) {
     ASSERT(slre_match("\\W+", "  ;.!  ab", 9, NULL, 0, 0) == 7);
   }
 
+  /* Required-literal prefilter: literal absent -> no match. The
+   * filter is tighter than the single-byte first-byte set. */
+  {
+    /* "abc" is a 3-byte required literal in this regex. */
+    ASSERT(slre_match("[0-9]+abc", "no digits here", 14, NULL, 0, 0)
+           == SLRE_NO_MATCH);
+    ASSERT(slre_match("[0-9]+abc", "x12abc!", 7, NULL, 0, 0) == 6);
+  }
+
+  /* .*LIT direct shortcut: greedy returns the LAST occurrence. */
+  {
+    ASSERT(slre_match(".*error", "ok", 2, NULL, 0, 0) == SLRE_NO_MATCH);
+    /* Greedy: prefers the last "error" position. */
+    ASSERT(slre_match(".*error", "first error then second error end",
+                      33, NULL, 0, 0) == 29);
+    /* Lazy: prefers the first. */
+    ASSERT(slre_match(".*?error", "first error then second error end",
+                      33, NULL, 0, 0) == 11);
+  }
+
+  /* Required literal as prefix lets the scanner jump straight to the
+   * literal's position. */
+  {
+    static char big[2048];
+    for (int i = 0; i < (int) sizeof(big); i++) big[i] = (char) ('a' + (i % 23));
+    memcpy(big + 1900, "tel:+1234", 9);
+    struct slre_cap c[1];
+    int n = slre_match("tel:\\+(\\d+)", big, (int) sizeof(big), c, 1, 0);
+    ASSERT(n == 1900 + 9);
+    ASSERT(c[0].len == 4);
+    ASSERT(memcmp(c[0].ptr, "1234", 4) == 0);
+  }
+
+  /* Multi-byte first-byte set scan: pattern needs no captures, set
+   * has 10 candidate bytes. */
+  {
+    char buf[1024];
+    for (int i = 0; i < (int) sizeof(buf); i++) buf[i] = 'a' + (i % 24);
+    /* No digits anywhere: NO_MATCH; the multi-memchr scan should
+     * exit fast. */
+    ASSERT(slre_match("[0-9]+x", buf, (int) sizeof(buf), NULL, 0, 0)
+           == SLRE_NO_MATCH);
+  }
+
+  /* No-capture Thompson VM correctness. */
+  {
+    /* Patterns must give the same answer with and without caps. */
+    static const char *str = "GET /api/v1/users HTTP/1.1";
+    int n_no_caps = slre_match("GET /\\w+/\\w+/\\w+ HTTP/\\d\\.\\d",
+                               str, (int) strlen(str), NULL, 0, 0);
+    struct slre_cap c[1];
+    int n_caps = slre_match("GET /\\w+/\\w+/\\w+ HTTP/\\d\\.\\d",
+                            str, (int) strlen(str), c, 1, 0);
+    ASSERT(n_no_caps == n_caps);
+    ASSERT(n_no_caps == 26);
+  }
+
   printf("Unit test %s (total test: %d, failed tests: %d)\n",
          static_failed_tests > 0 ? "FAILED" : "PASSED",
          static_total_tests, static_failed_tests);

@@ -151,6 +151,10 @@ struct slre {
   int has_first_byte_set;    /* 0 if unknown / unrestricted */
   int first_byte_count;      /* popcount of first_byte */
   unsigned char single_first_byte;
+  /* Materialized list of candidate first bytes — used for the scan
+   * loop's multi-memchr fast path when the set is small. */
+  unsigned char first_byte_list[16];
+  int first_byte_list_len;   /* 0 means "set too large for memchr scan" */
 
   /* Pure literal pattern (no metacharacters, no captures, no flags
    * beyond the optional ASCII fold). When set, slre_exec uses
@@ -165,6 +169,24 @@ struct slre {
   int simple_class_kind;
   int simple_class_idx;
 
+  /* Required literal substring: every successful match must contain
+   * these exact bytes in order. Computed from the longest consecutive
+   * run of OP_RUNE instructions that dominate OP_MATCH. Used as a
+   * cheap reject filter (Boyer-Moore-Horspool search) and, when the
+   * regex shape is .*LIT or .*?LIT with no captures, as a direct
+   * accept oracle. */
+  unsigned char *req_lit;
+  int req_lit_len;
+  /* When set, the required literal begins at the start of the match
+   * (no consumers between PC=0 and the first literal RUNE). In that
+   * case slre_exec can skip the per-position scan and seed the VM at
+   * the literal's position directly. */
+  int req_lit_is_prefix;
+  unsigned char bmh_skip[256];   /* BMH bad-character shift table */
+  /* Direct match shape: .*LIT (greedy) or .*?LIT (lazy) at the
+   * top level, no captures. 0=none, 1=greedy, 2=lazy. */
+  int dot_star_lit_kind;
+
   /* VM scratch: pre-allocated at compile time so slre_exec is
    * malloc-free on the hot path. The struct is therefore NOT
    * thread-safe; callers must use one struct slre per thread. */
@@ -175,6 +197,9 @@ struct slre {
   int *vm_seen_gen;        /* size code_len */
   int *vm_best_caps;       /* size n_save_slots */
   int *vm_cap_ints;        /* size n_save_slots, used by slre_exec */
+  /* Thompson (no-capture) lists: each entry is just a PC. */
+  int *vm_th_a;            /* size vm_max_per_step */
+  int *vm_th_b;
   int vm_max_per_step;
 };
 
@@ -723,6 +748,188 @@ static int compute_first_set(struct slre *p, uint64_t out[4],
   return popcnt;
 }
 
+/*
+ * Compute the longest required-literal substring: a sequence of
+ * consecutive OP_RUNE instructions, all of which dominate OP_MATCH.
+ *
+ * A PC dominates MATCH iff every path from PC=0 to OP_MATCH visits
+ * it. We compute domination by an O(N^2) reachability test: for each
+ * candidate PC, run a BFS from 0 in the bytecode graph that skips
+ * the candidate; if MATCH becomes unreachable, the PC dominates.
+ *
+ * Among the dominating PCs we look for the longest run of
+ * consecutive OP_RUNE ops (case-sensitive only — case-insensitive
+ * letters complicate byte-level search, so we exclude them). The
+ * literal is encoded as a UTF-8 byte string.
+ */
+static int reaches_match_skipping(const struct slre *p, int skip,
+                                  unsigned char *seen, int *stack) {
+  /* Returns 1 if any OP_MATCH is reachable from PC=0 without
+   * traversing PC=skip. Caller provides seen[] and stack[] scratch
+   * sized code_len. */
+  memset(seen, 0, (size_t) p->code_len);
+  int top = 0;
+  if (0 != skip) { stack[top++] = 0; seen[0] = 1; }
+  while (top > 0) {
+    int pc = stack[--top];
+    struct insn ins = p->code[pc];
+    if (ins.op == OP_MATCH) return 1;
+    /* push successors */
+    int succs[2]; int nsucc = 0;
+    switch (ins.op) {
+      case OP_JMP:
+        succs[nsucc++] = ins.a;
+        break;
+      case OP_SPLIT:
+        succs[nsucc++] = ins.a;
+        succs[nsucc++] = ins.b;
+        break;
+      default:
+        succs[nsucc++] = pc + 1;
+        break;
+    }
+    for (int i = 0; i < nsucc; i++) {
+      int s = succs[i];
+      if (s < 0 || s >= p->code_len) continue;
+      if (s == skip) continue;
+      if (seen[s]) continue;
+      seen[s] = 1;
+      stack[top++] = s;
+    }
+  }
+  return 0;
+}
+
+static void compute_required_literal(struct slre *p) {
+  if (p->code_len <= 0) return;
+  unsigned char *seen = (unsigned char *) malloc((size_t) p->code_len);
+  int *stack = (int *) malloc((size_t) p->code_len * sizeof(int));
+  unsigned char *dominates = (unsigned char *) calloc((size_t) p->code_len, 1);
+  if (seen == NULL || stack == NULL || dominates == NULL) {
+    free(seen); free(stack); free(dominates);
+    return;
+  }
+  for (int pc = 0; pc < p->code_len; pc++) {
+    /* PC=0 itself is trivially required if MATCH is reachable, but
+     * skipping it disconnects everything. We only care about RUNEs. */
+    if (p->code[pc].op != OP_RUNE) continue;
+    if (!reaches_match_skipping(p, pc, seen, stack)) {
+      dominates[pc] = 1;
+    }
+  }
+  /* Find longest consecutive RUNE run. */
+  int best_start = -1, best_len = 0;
+  int cur_start = -1, cur_len = 0;
+  for (int pc = 0; pc < p->code_len; pc++) {
+    if (dominates[pc] && p->code[pc].op == OP_RUNE) {
+      if (cur_start < 0) { cur_start = pc; cur_len = 0; }
+      cur_len++;
+    } else {
+      if (cur_len > best_len) {
+        best_len = cur_len;
+        best_start = cur_start;
+      }
+      cur_start = -1;
+      cur_len = 0;
+    }
+  }
+  if (cur_len > best_len) {
+    best_len = cur_len;
+    best_start = cur_start;
+  }
+  free(seen); free(stack); free(dominates);
+
+  if (best_len < 2) return;  /* not worth it; first-byte filter is enough */
+
+  /* Encode the rune sequence as UTF-8 bytes. */
+  int bytes = 0;
+  for (int i = 0; i < best_len; i++) {
+    int cp = p->code[best_start + i].a;
+    if (cp < 0x80) bytes += 1;
+    else if (cp < 0x800) bytes += 2;
+    else if (cp < 0x10000) bytes += 3;
+    else bytes += 4;
+  }
+  unsigned char *lit = (unsigned char *) malloc((size_t) bytes);
+  if (lit == NULL) return;
+  int off = 0;
+  for (int i = 0; i < best_len; i++) {
+    int cp = p->code[best_start + i].a;
+    if (cp < 0x80) {
+      lit[off++] = (unsigned char) cp;
+    } else if (cp < 0x800) {
+      lit[off++] = (unsigned char) (0xC0 | (cp >> 6));
+      lit[off++] = (unsigned char) (0x80 | (cp & 0x3F));
+    } else if (cp < 0x10000) {
+      lit[off++] = (unsigned char) (0xE0 | (cp >> 12));
+      lit[off++] = (unsigned char) (0x80 | ((cp >> 6) & 0x3F));
+      lit[off++] = (unsigned char) (0x80 | (cp & 0x3F));
+    } else {
+      lit[off++] = (unsigned char) (0xF0 | (cp >> 18));
+      lit[off++] = (unsigned char) (0x80 | ((cp >> 12) & 0x3F));
+      lit[off++] = (unsigned char) (0x80 | ((cp >> 6) & 0x3F));
+      lit[off++] = (unsigned char) (0x80 | (cp & 0x3F));
+    }
+  }
+  p->req_lit = lit;
+  p->req_lit_len = off;
+  /* Is the literal at a fixed offset 0 from match start? It is iff
+   * the path from PC=0 to best_start consists of nothing but SAVE
+   * instructions. */
+  p->req_lit_is_prefix = 1;
+  for (int pc = 0; pc < best_start; pc++) {
+    if (p->code[pc].op != OP_SAVE) {
+      p->req_lit_is_prefix = 0;
+      break;
+    }
+  }
+  /* BMH bad-character shift table. */
+  for (int i = 0; i < 256; i++) p->bmh_skip[i] = (unsigned char) off;
+  for (int i = 0; i < off - 1; i++) {
+    int shift = off - 1 - i;
+    if (shift > 255) shift = 255;
+    p->bmh_skip[lit[i]] = (unsigned char) shift;
+  }
+}
+
+/* Detect the .*LIT (greedy) or .*?LIT (lazy) shape, where LIT is
+ * exactly the required literal computed above. When recognized, the
+ * match end is determined directly by the literal search:
+ *   greedy: last occurrence + lit_len
+ *   lazy:   first occurrence + lit_len
+ * and the match start is 0 (offset 0 of the buffer), since .* / .*?
+ * can absorb anything between offset 0 and the literal. */
+static void compute_dot_star_lit(struct slre *p) {
+  /* Shape with greedy .*: SAVE 0(0); SPLIT(2,4)(1); ANY(2); JMP 1(3);
+   *   <lit RUNE...>; SAVE 1; MATCH.
+   * Shape with lazy  .*?: SAVE 0(0); SPLIT(4,2)(1); ANY(2); JMP 1(3);
+   *   <lit RUNE...>; SAVE 1; MATCH.
+   */
+  if (p->n_groups != 0) return;
+  if (p->req_lit_len < 1) return;
+  if (p->code_len < 6) return;
+  if (p->code[0].op != OP_SAVE || p->code[0].a != 0) return;
+  if (p->code[1].op != OP_SPLIT) return;
+  if (p->code[2].op != OP_ANY) return;
+  if (p->code[3].op != OP_JMP || p->code[3].a != 1) return;
+  if (p->code[p->code_len - 1].op != OP_MATCH) return;
+  if (p->code[p->code_len - 2].op != OP_SAVE
+      || p->code[p->code_len - 2].a != 1) return;
+  /* All instructions between PC=4 and PC=code_len-2 must be RUNE
+   * (the literal). And the RUNEs must MATCH the bytes already in
+   * req_lit (since req_lit was computed from this very dominator
+   * chain). */
+  int n = p->code_len - 2 - 4;
+  if (n <= 0) return;
+  for (int i = 0; i < n; i++) {
+    if (p->code[4 + i].op != OP_RUNE) return;
+  }
+  /* Greedy if SPLIT.a points at body=2, lazy if SPLIT.a points at
+   * after=4. */
+  if (p->code[1].a == 2 && p->code[1].b == 4) p->dot_star_lit_kind = 1;
+  else if (p->code[1].a == 4 && p->code[1].b == 2) p->dot_star_lit_kind = 2;
+}
+
 /* Detect a pure-literal regex (no metas, no quantifiers, no groups)
  * and record the byte sequence for fast memchr/memcmp matching. */
 static void compute_pure_literal(struct slre *p) {
@@ -794,6 +1001,7 @@ void slre_free(struct slre *re) {
   free(re->code);
   free(re->classes);
   free(re->literal);
+  free(re->req_lit);
   free(re->vm_clist);
   free(re->vm_nlist);
   free(re->vm_pool_a);
@@ -801,6 +1009,8 @@ void slre_free(struct slre *re) {
   free(re->vm_seen_gen);
   free(re->vm_best_caps);
   free(re->vm_cap_ints);
+  free(re->vm_th_a);
+  free(re->vm_th_b);
   free(re);
 }
 
@@ -868,9 +1078,24 @@ int slre_compile(const char *pattern, int flags, struct slre **out) {
         }
       }
     }
+    /* Materialize the candidate list when the set is small enough
+     * for a multi-memchr scan to outperform a per-byte bitmap test.
+     * The threshold is set so that the cost of N memchr calls beats
+     * the per-byte loop on typical buffers. */
+    if (n <= 16) {
+      int k = 0;
+      for (int i = 0; i < 256; i++) {
+        if (fb[i >> 6] & (1ull << (i & 63))) {
+          p->first_byte_list[k++] = (unsigned char) i;
+        }
+      }
+      p->first_byte_list_len = k;
+    }
   }
 
   compute_pure_literal(p);
+  compute_required_literal(p);
+  compute_dot_star_lit(p);
 
   /* Simple greedy class-repeat detection. [CLASS]+ compiles to:
    *   0: SAVE 0
@@ -916,10 +1141,12 @@ int slre_compile(const char *pattern, int flags, struct slre **out) {
   p->vm_seen_gen  = (int *) calloc((size_t) p->code_len, sizeof(int));
   p->vm_best_caps = (int *) malloc((size_t) p->n_save_slots * sizeof(int));
   p->vm_cap_ints  = (int *) malloc((size_t) p->n_save_slots * sizeof(int));
+  p->vm_th_a      = (int *) malloc((size_t) p->vm_max_per_step * sizeof(int));
+  p->vm_th_b      = (int *) malloc((size_t) p->vm_max_per_step * sizeof(int));
   if (p->vm_clist == NULL || p->vm_nlist == NULL ||
       p->vm_pool_a == NULL || p->vm_pool_b == NULL ||
       p->vm_seen_gen == NULL || p->vm_best_caps == NULL ||
-      p->vm_cap_ints == NULL) {
+      p->vm_cap_ints == NULL || p->vm_th_a == NULL || p->vm_th_b == NULL) {
     slre_free(p);
     return SLRE_OUT_OF_MEMORY;
   }
@@ -961,6 +1188,138 @@ static void cap_init(int *caps, int n) {
 static void cap_copy(int *dst, const int *src, int n) {
   memcpy(dst, src, (size_t) n * sizeof(int));
 }
+
+/* ------------------------------------------------------------------ */
+/* Thompson VM (no-capture)                                            */
+/* ------------------------------------------------------------------ */
+
+/* Add a PC to a Thompson thread list. SAVE is a no-op (no captures).
+ * Per-step (pc, gen) dedup, leftmost-first by add order. */
+static void add_thompson(const struct slre *re, int *list, int *n,
+                         int pc, int sp, int gen, int *seen_gen,
+                         int buf_len) {
+  while (1) {
+    if (pc < 0 || pc >= re->code_len) return;
+    if (seen_gen[pc] == gen) return;
+    seen_gen[pc] = gen;
+    struct insn ins = re->code[pc];
+    switch (ins.op) {
+      case OP_JMP:
+        pc = ins.a;
+        continue;
+      case OP_SPLIT:
+        add_thompson(re, list, n, ins.a, sp, gen, seen_gen, buf_len);
+        pc = ins.b;
+        continue;
+      case OP_SAVE:
+        pc = pc + 1;
+        continue;
+      case OP_BOL:
+        if (sp != 0) return;
+        pc = pc + 1;
+        continue;
+      case OP_EOL:
+        if (sp != buf_len) return;
+        pc = pc + 1;
+        continue;
+      default:
+        list[(*n)++] = pc;
+        return;
+    }
+  }
+}
+
+/* Run the no-capture Thompson VM. On success returns the byte offset
+ * just past the match. Caller knows the match start (== start_off for
+ * leftmost matches). */
+static int run_thompson(struct slre *re, const unsigned char *buf,
+                        int buf_len, int start_off) {
+  int code_len = re->code_len;
+  int *clist = re->vm_th_a;
+  int *nlist = re->vm_th_b;
+  int n_c = 0, n_n = 0;
+  int *seen_gen = re->vm_seen_gen;
+  memset(seen_gen, 0, (size_t) code_len * sizeof(int));
+  int gen = 1;
+
+  add_thompson(re, clist, &n_c, 0, start_off, gen, seen_gen, buf_len);
+
+  int has_match = 0;
+  int best_end = -1;
+  int sp = start_off;
+
+  while (1) {
+    if (n_c == 0) break;
+
+    int rune_len = 0;
+    int cp = -1;
+    if (sp < buf_len) {
+      cp = utf8_decode(buf + sp, buf_len - sp, &rune_len);
+      if (rune_len <= 0) rune_len = 1;
+    }
+
+    gen++;
+    n_n = 0;
+
+    for (int ti = 0; ti < n_c; ti++) {
+      int pc = clist[ti];
+      struct insn ins = re->code[pc];
+
+      if (ins.op == OP_MATCH) {
+        has_match = 1;
+        best_end = sp;
+        break;  /* lower-priority threads in clist are killed */
+      }
+      if (cp < 0) continue;
+
+      int matched = 0;
+      switch (ins.op) {
+        case OP_RUNE:
+          matched = (cp == ins.a);
+          break;
+        case OP_RUNE_CI:
+          matched = (cp < 128 && ascii_lower(cp) == ins.a);
+          break;
+        case OP_CLASS:
+          matched = sclass_test(&re->classes[ins.a], (unsigned char) buf[sp]);
+          break;
+        case OP_ANY:
+          matched = 1;
+          break;
+        default:
+          break;
+      }
+      if (matched) {
+        add_thompson(re, nlist, &n_n, pc + 1, sp + rune_len,
+                     gen, seen_gen, buf_len);
+      }
+    }
+
+    /* Swap. */
+    int *tmp = clist; clist = nlist; nlist = tmp;
+    n_c = n_n; n_n = 0;
+
+    if (rune_len == 0) break;
+    sp += rune_len;
+  }
+
+  /* Drain: any remaining MATCH thread fires at the final sp. */
+  if (!has_match) {
+    for (int ti = 0; ti < n_c; ti++) {
+      if (re->code[clist[ti]].op == OP_MATCH) {
+        has_match = 1;
+        best_end = sp;
+        break;
+      }
+    }
+  }
+
+  return has_match ? best_end : SLRE_NO_MATCH;
+}
+
+/* ------------------------------------------------------------------ */
+/* Pike VM (with captures)                                             */
+/* ------------------------------------------------------------------ */
 
 /*
  * Add a thread at pc to list l with the given captures and current
@@ -1225,6 +1584,63 @@ static int find_pure_literal(const struct slre *re,
   }
 }
 
+/*
+ * Substring search returning the leftmost match offset, or -1.
+ *
+ * Strategy: for short needles (the common case for required regex
+ * literals), memchr is heavily vectorized in libc and dominates a
+ * scalar Boyer-Moore-Horspool inner loop. We use memchr to find the
+ * first-byte candidate, verify with memcmp, and slide. For longer
+ * needles (>= 8 bytes) we fall through to BMH whose bad-character
+ * shift becomes worth the inner-loop overhead.
+ */
+static int find_lit(const unsigned char *haystack, int hlen,
+                    const unsigned char *needle, int nlen,
+                    const unsigned char *skip) {
+  if (nlen <= 0 || hlen < nlen) return -1;
+  if (nlen == 1) {
+    const unsigned char *p =
+      (const unsigned char *) memchr(haystack, needle[0], (size_t) hlen);
+    return p == NULL ? -1 : (int)(p - haystack);
+  }
+  int last = hlen - nlen;
+  if (nlen < 8) {
+    int i = 0;
+    while (i <= last) {
+      const unsigned char *p = (const unsigned char *)
+        memchr(haystack + i, needle[0], (size_t)(last - i + 1));
+      if (p == NULL) return -1;
+      i = (int)(p - haystack);
+      if (memcmp(haystack + i, needle, (size_t) nlen) == 0) return i;
+      i++;
+    }
+    return -1;
+  }
+  /* BMH for longer needles. */
+  int i = 0;
+  while (i <= last) {
+    int j = nlen - 1;
+    while (j >= 0 && haystack[i + j] == needle[j]) j--;
+    if (j < 0) return i;
+    int shift = skip[haystack[i + nlen - 1]];
+    i += shift > 0 ? shift : 1;
+  }
+  return -1;
+}
+
+/* Rightmost match — used by the greedy .*LIT shortcut. */
+static int find_lit_last(const unsigned char *haystack, int hlen,
+                         const unsigned char *needle, int nlen) {
+  if (nlen <= 0 || hlen < nlen) return -1;
+  for (int i = hlen - nlen; i >= 0; i--) {
+    if (haystack[i] == needle[0] &&
+        memcmp(haystack + i, needle, (size_t) nlen) == 0) {
+      return i;
+    }
+  }
+  return -1;
+}
+
 int slre_exec(const struct slre *re, const char *buf_, int buf_len,
               struct slre_cap *caps, int num_caps,
               struct slre_result *result) {
@@ -1252,6 +1668,37 @@ int slre_exec(const struct slre *re, const char *buf_, int buf_len,
       result->ncaps = 0;
     }
     return end;
+  }
+
+  /* .*LIT / .*?LIT direct-accept shortcut (no captures). */
+  if (re->dot_star_lit_kind != 0 && num_caps == 0) {
+    int pos;
+    if (re->dot_star_lit_kind == 1) {
+      pos = find_lit_last(buf, buf_len, re->req_lit, re->req_lit_len);
+    } else {
+      pos = find_lit(buf, buf_len, re->req_lit, re->req_lit_len,
+                     re->bmh_skip);
+    }
+    if (pos < 0) return SLRE_NO_MATCH;
+    int end = pos + re->req_lit_len;
+    if (result != NULL) {
+      result->start = 0;
+      result->end = end;
+      result->ncaps = 0;
+    }
+    return end;
+  }
+
+  /* Required-literal reject filter: if there's a literal substring
+   * that every match must contain, and it isn't anywhere in the
+   * input, we can return NO_MATCH without running the VM. We only
+   * apply this when the literal is NOT the prefix — when it is the
+   * prefix we'll use it for candidate scanning below, which already
+   * subsumes this filter. */
+  if (re->req_lit_len >= 2 && !re->req_lit_is_prefix) {
+    int found = find_lit(buf, buf_len, re->req_lit, re->req_lit_len,
+                         re->bmh_skip);
+    if (found < 0) return SLRE_NO_MATCH;
   }
 
   /* Greedy single-class repeat fast path. */
@@ -1307,8 +1754,20 @@ int slre_exec(const struct slre *re, const char *buf_, int buf_len,
 
   int p = 0;
   while (p <= last_start) {
-    /* First-byte prefilter. */
-    if (re->has_first_byte_set) {
+    /* Find next candidate start position using the most precise
+     * filter available. The required-literal-prefix filter is
+     * tightest: a multi-byte literal that must begin at the match
+     * start. Falling back: single-byte first-byte memchr, then a
+     * 256-bit byte set scan. */
+    if (re->req_lit_is_prefix && re->req_lit_len >= 2) {
+      int remaining = buf_len - p;
+      int found = find_lit(buf + p, remaining,
+                           re->req_lit, re->req_lit_len,
+                           re->bmh_skip);
+      if (found < 0) break;
+      p += found;
+      if (p > last_start) break;
+    } else if (re->has_first_byte_set) {
       int found = -1;
       const unsigned char *bp = buf + p;
       int remaining = last_start - p + 1;
@@ -1317,6 +1776,22 @@ int slre_exec(const struct slre *re, const char *buf_, int buf_len,
           memchr(bp, re->single_first_byte, (size_t) remaining);
         if (q == NULL) break;
         found = (int)(q - buf);
+      } else if (re->first_byte_list_len > 0 && !icase) {
+        /* Multi-memchr scan: search for each candidate byte and keep
+         * the leftmost. We bound the second and subsequent searches
+         * by the current best so they don't re-scan past it. */
+        int best = remaining;
+        for (int k = 0; k < re->first_byte_list_len; k++) {
+          if (best == 0) break;
+          const unsigned char *q = (const unsigned char *)
+            memchr(bp, re->first_byte_list[k], (size_t) best);
+          if (q != NULL) {
+            int pos = (int)(q - bp);
+            if (pos < best) best = pos;
+          }
+        }
+        if (best == remaining) break;
+        found = p + best;
       } else {
         for (int i = 0; i < remaining; i++) {
           unsigned b = bp[i];
@@ -1331,7 +1806,16 @@ int slre_exec(const struct slre *re, const char *buf_, int buf_len,
     }
 
     int s = -1;
-    int end = run_pike(re_mut, buf, buf_len, p, cap_ints, &s);
+    int end;
+    /* Thompson VM is sufficient when the caller doesn't request
+     * captures. The match start is the seed position p; the engine
+     * just reports the end offset. */
+    if (num_caps == 0 && (result == NULL || re->n_groups == 0)) {
+      end = run_thompson(re_mut, buf, buf_len, p);
+      s = p;
+    } else {
+      end = run_pike(re_mut, buf, buf_len, p, cap_ints, &s);
+    }
     if (end == SLRE_OUT_OF_MEMORY) { ret = SLRE_OUT_OF_MEMORY; break; }
     if (end >= 0) {
       ret = end;
