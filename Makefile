@@ -1,8 +1,8 @@
 CC      ?= cc
 CSTD    ?= -std=c23
-CFLAGS  ?= -O2 -Wall -Wextra -fomit-frame-pointer
-LDFLAGS ?=
 RELEASE_CFLAGS ?= -O3 -flto -Wall -Wextra -fomit-frame-pointer
+CFLAGS  ?= $(RELEASE_CFLAGS)
+LDFLAGS ?=
 NATIVE_CFLAGS  ?= $(RELEASE_CFLAGS) -march=native
 
 # Benchmark uses clock_gettime, which needs a recent POSIX feature
@@ -14,35 +14,35 @@ BENCH_CFLAGS = -D_POSIX_C_SOURCE=200809L
 
 all: unit_test
 
-unit_test: unit_test.c hfre.c hfre.h
+unit_test: unit_test.c hfre.c hfre.h Makefile
 	$(CC) $(CSTD) $(CFLAGS) -o $@ unit_test.c hfre.c $(LDFLAGS)
 
-bench: bench.c hfre.c hfre.h
+bench: bench.c hfre.c hfre.h Makefile
 	$(CC) $(CSTD) $(CFLAGS) $(BENCH_CFLAGS) -o $@ bench.c hfre.c $(LDFLAGS)
 
 test: unit_test
 	./unit_test
 
-unit_test_scalar: unit_test.c hfre.c hfre.h
+unit_test_scalar: unit_test.c hfre.c hfre.h Makefile
 	$(CC) $(CSTD) $(CFLAGS) -DHFRE_DISABLE_SIMD -o $@ unit_test.c hfre.c $(LDFLAGS)
 
 test-scalar: unit_test_scalar
 	./unit_test_scalar
 
-allocation_test: allocation_test.c hfre.c hfre.h
+allocation_test: allocation_test.c hfre.c hfre.h Makefile
 	$(CC) $(CSTD) $(CFLAGS) -o $@ allocation_test.c $(LDFLAGS)
 
 test-alloc: allocation_test
 	./allocation_test
 
-bench_scalar: bench.c hfre.c hfre.h
+bench_scalar: bench.c hfre.c hfre.h Makefile
 	$(CC) $(CSTD) $(CFLAGS) $(BENCH_CFLAGS) -DHFRE_DISABLE_SIMD \
 		-o $@ bench.c hfre.c $(LDFLAGS)
 
 bench-scalar: bench_scalar
 
-# Separate outputs keep an existing -O2 binary from being reused when
-# switching profiles. LTO flags apply to compilation and linking here.
+# Separate outputs avoid reusing a binary built with another profile.
+# LTO flags apply to compilation and linking here.
 unit_test_release: unit_test.c hfre.c hfre.h Makefile
 	$(CC) $(CSTD) $(RELEASE_CFLAGS) -o $@ unit_test.c hfre.c $(LDFLAGS)
 

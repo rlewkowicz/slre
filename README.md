@@ -38,7 +38,7 @@ make             # builds unit_test
 make test        # runs the unit tests
 make test-scalar # tests with HFRE_DISABLE_SIMD
 make test-alloc  # allocation accounting and failure injection
-make bench       # builds bench with default -O2 flags
+make bench       # builds bench with default -O3 -flto flags
 make bench-scalar # builds bench_scalar with HFRE_DISABLE_SIMD
 make bench-release test-release # -O3 -flto, builds bench_release
 make bench-native test-native   # also -march=native, builds bench_native
@@ -47,6 +47,9 @@ make asan-scalar CC=clang # ASAN/UBSAN without SIMD
 make portable-syntax   # -std=c23 -pedantic-errors -fsyntax-only
 ```
 
+The default is the release profile: `-O3 -flto -fomit-frame-pointer`.
+It had the best geometric mean across the 25 benchmark workloads and
+the best compiled-matching aggregate in the compiler comparison.
 Release builds retain runtime CPU dispatch. Native builds target the
 build machine's instruction set; rebuild on the destination CPU when
 using that profile. Both profiles include `-fomit-frame-pointer`.
@@ -107,7 +110,7 @@ so these measurements reflect warm caches. Native tuning is workload
 dependent: it helps some compilation cases but slows the small
 `^(a*)CONTROL` execution case.
 
-Run `taskset -c 2 ./bench_release` on this machine, or choose a verified
+Run `taskset -c 2 ./bench` on this machine, or choose a verified
 performance core on your machine. Add `--exec-only` for compiled matching.
 The harness checks compile and match results and warms each workload
 before timing. For frequent calls, prefer the compiled API.

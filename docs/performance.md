@@ -8,8 +8,8 @@ rounds and a rotating configuration order.
 
 ## Build profiles and compiler flags
 
-The default build uses `-O2 -fomit-frame-pointer`. `make bench-release`
-builds `bench_release` with `-O3 -flto -fomit-frame-pointer`;
+The default build uses `-O3 -flto -fomit-frame-pointer`. `make bench-release`
+builds `bench_release` with the same flags;
 `make bench-native` builds `bench_native` with those flags plus
 `-march=native`. Separate filenames prevent accidentally timing a binary
 left over from another profile. `make test-release` and `make test-native`
@@ -32,6 +32,14 @@ across the application/engine boundary; use it at both compilation and
 linking when integrating the source. Native tuning enables instructions
 for the build CPU throughout the program, beyond the guarded AVX2 functions.
 Use the release profile for binaries intended to run on other CPUs.
+
+The release profile is the default because it had the highest geometric
+mean of per-workload speed ratios across all 25 cases: 1.086× relative
+to `-O2`, versus 1.078× for native LTO. It also led the 18 compiled-matching
+cases, at 1.075× versus 1.054×. Each workload receives equal weight in
+these aggregates; they do not predict a particular application's mix.
+Native LTO led the seven compile-and-match cases. Sub-nanosecond
+differences should be treated as timing noise rather than reliable wins.
 
 Adding `-fno-semantic-interposition` to the native LTO benchmark produced
 an identical executable `.text` section. This directly linked executable
