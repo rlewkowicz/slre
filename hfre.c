@@ -35,16 +35,23 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Keep the baseline ISA portable. Only these separately compiled
+ * functions use AVX2, and callers check CPU/OS support at runtime. */
+#if !defined(HFRE_DISABLE_SIMD) && \
+    (defined(__x86_64__) || defined(__i386__)) && \
+    (defined(__GNUC__) || defined(__clang__))
+#define HFRE_HAVE_AVX2 1
+#include <immintrin.h>
+#else
+#define HFRE_HAVE_AVX2 0
+#endif
+
 /* ------------------------------------------------------------------ */
 /* Helpers                                                             */
 /* ------------------------------------------------------------------ */
 
 static inline int ascii_lower(int c) {
   return (c >= 'A' && c <= 'Z') ? c + 32 : c;
-}
-
-static inline int ascii_upper(int c) {
-  return (c >= 'a' && c <= 'z') ? c - 32 : c;
 }
 
 static inline int is_ascii_letter(int c) {
@@ -538,7 +545,7 @@ static const struct fold_pair unicode_folds[] = {
 };
 
 static int unicode_simple_fold(int cp) {
-  if (cp >= 'A' && cp <= 'Z') return cp + 32;
+  if (cp < 128) return ascii_lower(cp);
   int lo = 0;
   int hi = (int)(sizeof(unicode_folds) / sizeof(unicode_folds[0])) - 1;
   while (lo <= hi) {
@@ -1307,6 +1314,9 @@ struct sclass {
   uint64_t prop_pos;  /* Unicode properties that match positively */
   uint64_t prop_neg;  /* Unicode properties that match when absent */
   int inverted;
+#if HFRE_HAVE_AVX2
+  unsigned char ascii_lut[16]; /* low nibble -> bits for high nibbles 0..7 */
+#endif
 };
 
 #define HFRE_MAX_MULTI_LITS 16
@@ -1324,9 +1334,11 @@ struct litop {
 
 struct dfa_state {
   uint64_t bits;
-  int trans[128];     /* -2 unknown, -1 dead, >=0 state index */
+  int8_t trans[128];  /* -2 unknown, -1 dead, 0..63 state index */
   int is_match;
 };
+
+static_assert(HFRE_DFA_MAX_STATES <= 128, "DFA state IDs must fit in int8_t");
 
 /* VM thread record (declared up front so struct hfre can size its
  * scratch buffers in terms of sizeof(struct thread)). */
@@ -1411,7 +1423,8 @@ struct hfre {
   unsigned char first_byte_list[16];
   int first_byte_list_len;   /* 0 means "set too large for memchr scan" */
 
-  /* Pure literal pattern (no metacharacters, no captures, case-sensitive).
+  /* Pure literal pattern (optionally start-anchored, no captures,
+   * case-sensitive).
    * When set, hfre_exec uses memchr+memcmp instead of the VM. */
   unsigned char *literal;
   int literal_len;
@@ -1454,10 +1467,6 @@ struct hfre {
   int multi_lit_is_prefix;
   uint64_t multi_first[4];
 
-  uint64_t shift_or_mask[256];
-  int has_shift_or;
-  int shift_or_len;
-
   int simple_rune_kind;     /* 0 none, 1 plus, 2 star */
   int simple_rune_cp;
   int simple_rune_icase;
@@ -1469,6 +1478,7 @@ struct hfre {
   /* VM scratch: pre-allocated at compile time so hfre_exec is
    * malloc-free on the hot path. The struct is therefore NOT
    * thread-safe; callers must use one struct hfre per thread. */
+  void *vm_scratch;        /* owns all VM buffers below */
   void *vm_clist;          /* struct thread *, length vm_max_per_step */
   void *vm_nlist;          /* struct thread *, length vm_max_per_step */
   int *vm_pool_a;          /* size vm_max_per_step * n_save_slots */
@@ -1476,7 +1486,7 @@ struct hfre {
   int *vm_seen_gen;        /* size code_len */
   int *vm_best_caps;       /* size n_save_slots */
   int *vm_cap_ints;        /* size n_save_slots, used by hfre_exec */
-  /* Thompson (no-capture) lists: each entry is just a PC. */
+  /* Thompson lists reuse the thread lists: the VMs never run together. */
   int *vm_th_a;            /* size vm_max_per_step */
   int *vm_th_b;
   int vm_max_per_step;
@@ -2129,9 +2139,19 @@ static int compute_first_set(struct hfre *p, uint64_t out[4],
           if (bits != 0) has_any = 1;
         }
         if (p->flags & HFRE_IGNORE_CASE) {
-          for (int b = 0; b < 256; b++) {
+          /* Include encoded lead bytes for non-ASCII class members,
+           * then walk the fold table once for the entire class. */
+          for (int b = 128; b < 256; b++) {
             if (sclass_byte_raw(cls, (unsigned char) b)) {
-              first_set_add_folded_cp(out, b);
+              first_set_add_cp(out, b);
+            }
+          }
+          int count = (int)(sizeof(unicode_folds) / sizeof(unicode_folds[0]));
+          for (int i = 0; i < count; i++) {
+            int folded = unicode_folds[i].to;
+            if (folded <= 255 &&
+                sclass_byte_raw(cls, (unsigned char) folded)) {
+              first_set_add_cp(out, unicode_folds[i].from);
             }
           }
         }
@@ -2590,7 +2610,7 @@ static void compute_suffix_literal(struct hfre *p) {
   p->suffix_lit_full = full;
 }
 
-/* Detect a pure-literal regex (no metas, no quantifiers, no groups)
+/* Detect a pure-literal regex (optional ^, no quantifiers, no groups)
  * and record the byte sequence for fast memchr/memcmp matching. */
 static void compute_pure_literal(struct hfre *p) {
   if (p->n_groups > 0) return;
@@ -2601,73 +2621,16 @@ static void compute_pure_literal(struct hfre *p) {
   if (p->code[p->code_len - 2].op != OP_SAVE
       || p->code[p->code_len - 2].a != 1) return;
 
-  int n = p->code_len - 3;
-  int icase = 0;
-  /* All inner ops must be OP_RUNE (any rune) or OP_RUNE_CI (icase
-   * letters). For multi-byte runes we expand to UTF-8 bytes below. */
-  int total_bytes = 0;
-  for (int i = 1; i <= n; i++) {
-    int op = p->code[i].op;
-    if (op == OP_RUNE_CI) {
-      if (p->code[i].a >= 128) return;
-      icase = 1;
-      total_bytes += 1;
-      continue;
-    }
-    if (op != OP_RUNE) return;  /* not pure */
-    int cp = p->code[i].a;
-    if (cp < 0x80)        total_bytes += 1;
-    else if (cp < 0x800)  total_bytes += 2;
-    else if (cp < 0x10000) total_bytes += 3;
-    else                   total_bytes += 4;
+  int start = 1;
+  if (p->code[start].op == OP_BOL) start++;
+  int end = p->code_len - 2;
+  if (start == end) return;
+  for (int i = start; i < end; i++) {
+    if (p->code[i].op != OP_RUNE) return;
   }
-  if (total_bytes == 0) return;  /* empty pattern */
-  unsigned char *lit = (unsigned char *) malloc((size_t) total_bytes);
-  if (lit == NULL) return;
-  int off = 0;
-  for (int i = 1; i <= n; i++) {
-    int op = p->code[i].op;
-    int cp = p->code[i].a;
-    if (op == OP_RUNE_CI) {
-      lit[off++] = (unsigned char) cp;        /* already lowercase */
-      continue;
-    }
-    /* OP_RUNE: encode as UTF-8 bytes. For icase compares we lowercase
-     * ASCII bytes here too so the buffer is uniform. */
-    int b0 = cp;
-    if (icase && b0 < 128 && is_ascii_letter(b0)) b0 = ascii_lower(b0);
-    if (cp < 0x80) {
-      lit[off++] = (unsigned char) b0;
-    } else if (cp < 0x800) {
-      lit[off++] = (unsigned char) (0xC0 | (cp >> 6));
-      lit[off++] = (unsigned char) (0x80 | (cp & 0x3F));
-    } else if (cp < 0x10000) {
-      lit[off++] = (unsigned char) (0xE0 | (cp >> 12));
-      lit[off++] = (unsigned char) (0x80 | ((cp >> 6) & 0x3F));
-      lit[off++] = (unsigned char) (0x80 | (cp & 0x3F));
-    } else {
-      lit[off++] = (unsigned char) (0xF0 | (cp >> 18));
-      lit[off++] = (unsigned char) (0x80 | ((cp >> 12) & 0x3F));
-      lit[off++] = (unsigned char) (0x80 | ((cp >> 6) & 0x3F));
-      lit[off++] = (unsigned char) (0x80 | (cp & 0x3F));
-    }
+  if (encode_rune_run(p, start, end - start, &p->literal, &p->literal_len)) {
+    p->is_pure_literal = 1;
   }
-  p->literal = lit;
-  p->literal_len = off;
-  p->is_pure_literal = 1;
-  if (icase) p->flags |= HFRE_IGNORE_CASE;
-}
-
-static void compute_shift_or(struct hfre *p) {
-  if (!p->is_pure_literal) return;
-  if (p->flags & HFRE_IGNORE_CASE) return;
-  if (p->literal_len <= 0 || p->literal_len > 63) return;
-  for (int i = 0; i < 256; i++) p->shift_or_mask[i] = ~0ull;
-  for (int i = 0; i < p->literal_len; i++) {
-    p->shift_or_mask[p->literal[i]] &= ~(1ull << i);
-  }
-  p->has_shift_or = 1;
-  p->shift_or_len = p->literal_len;
 }
 
 static int hex_value(int c) {
@@ -2866,6 +2829,48 @@ static void compute_simple_rune_repeat(struct hfre *p) {
   }
 }
 
+/* Whole-pattern greedy class repeats always execute directly. Detect
+ * them before allocating filters, the DFA cache, or VM scratch. */
+static void compute_simple_class_repeat(struct hfre *p) {
+  if (p->n_groups == 0 && p->code_len == 5 &&
+      p->code[0].op == OP_SAVE && p->code[0].a == 0 &&
+      p->code[1].op == OP_CLASS &&
+      p->code[2].op == OP_SPLIT && p->code[2].a == 1 && p->code[2].b == 3 &&
+      p->code[3].op == OP_SAVE && p->code[3].a == 1 &&
+      p->code[4].op == OP_MATCH) {
+    const struct sclass *cls = &p->classes[p->code[1].a];
+    if (cls->prop_pos || cls->prop_neg || !sclass_has_high_byte(cls)) {
+      p->simple_class_kind = 1;
+      p->simple_class_idx = p->code[1].a;
+    }
+  } else if (p->n_groups == 0 && p->code_len == 6 &&
+      p->code[0].op == OP_SAVE && p->code[0].a == 0 &&
+      p->code[1].op == OP_SPLIT && p->code[1].a == 2 && p->code[1].b == 4 &&
+      p->code[2].op == OP_CLASS &&
+      p->code[3].op == OP_JMP && p->code[3].a == 1 &&
+      p->code[4].op == OP_SAVE && p->code[4].a == 1 &&
+      p->code[5].op == OP_MATCH) {
+    const struct sclass *cls = &p->classes[p->code[2].a];
+    if (cls->prop_pos || cls->prop_neg || !sclass_has_high_byte(cls)) {
+      p->simple_class_kind = 2;
+      p->simple_class_idx = p->code[2].a;
+    }
+  }
+#if HFRE_HAVE_AVX2
+  if (p->simple_class_kind) {
+    struct sclass *cls = &p->classes[p->simple_class_idx];
+    for (int lo = 0; lo < 16; lo++) {
+      unsigned bits = 0;
+      for (int hi = 0; hi < 8; hi++) {
+        bits |= (unsigned) sclass_byte_raw(cls, (unsigned char)(16 * hi + lo))
+                << hi;
+      }
+      cls->ascii_lut[lo] = (unsigned char) bits;
+    }
+  }
+#endif
+}
+
 static int dfa_supported_class(const struct sclass *cls) {
   return cls->prop_pos == 0 && cls->prop_neg == 0;
 }
@@ -2984,15 +2989,7 @@ void hfre_free(struct hfre *re) {
     free(re->multi_lits[i].s);
   }
   free(re->dfa_states);
-  free(re->vm_clist);
-  free(re->vm_nlist);
-  free(re->vm_pool_a);
-  free(re->vm_pool_b);
-  free(re->vm_seen_gen);
-  free(re->vm_best_caps);
-  free(re->vm_cap_ints);
-  free(re->vm_th_a);
-  free(re->vm_th_b);
+  free(re->vm_scratch);
   free(re);
 }
 
@@ -3040,6 +3037,18 @@ int hfre_compile(const char *pattern, int flags, struct hfre **out) {
     }
   }
 
+  /* These paths answer every exec directly, including calls that
+   * supply an unused capture array. No VM or other filters are needed. */
+  compute_pure_literal(p);
+  compute_suffix_literal(p);
+  compute_simple_class_repeat(p);
+  compute_simple_rune_repeat(p);
+  if (p->is_pure_literal || p->suffix_lit_len > 0 ||
+      p->simple_class_kind || p->simple_rune_kind) {
+    *out = p;
+    return 0;
+  }
+
   uint64_t fb[4] = { 0 };
   int min_len = 0;
   int n = compute_first_set(p, fb, &min_len);
@@ -3076,75 +3085,59 @@ int hfre_compile(const char *pattern, int flags, struct hfre **out) {
   }
 
   compute_match_bounds(p);
-  compute_pure_literal(p);
-  compute_shift_or(p);
   compute_required_literal(p);
   compute_dot_star_lit(p);
-  compute_suffix_literal(p);
   compute_multi_literals(p, ps.re, ps.re_len);
   compute_literal_run_opcodes(p);
 
-  /* Simple greedy class-repeat detection. [CLASS]+ compiles to:
-   *   0: SAVE 0
-   *   1: CLASS idx
-   *   2: SPLIT 1, 3      (greedy: loop body or escape)
-   *   3: SAVE 1
-   *   4: MATCH
-   * [CLASS]* compiles to:
-   *   0: SAVE 0
-   *   1: SPLIT 2, 4      (greedy: enter or skip)
-   *   2: CLASS idx
-   *   3: JMP 1
-   *   4: SAVE 1
-   *   5: MATCH
-   */
-  if (p->n_groups == 0 && p->code_len == 5 &&
-      p->code[0].op == OP_SAVE && p->code[0].a == 0 &&
-      p->code[1].op == OP_CLASS &&
-      p->code[2].op == OP_SPLIT && p->code[2].a == 1 && p->code[2].b == 3 &&
-      p->code[3].op == OP_SAVE && p->code[3].a == 1 &&
-      p->code[4].op == OP_MATCH) {
-    const struct sclass *cls = &p->classes[p->code[1].a];
-    if (cls->prop_pos || cls->prop_neg || !sclass_has_high_byte(cls)) {
-      p->simple_class_kind = 1;
-      p->simple_class_idx = p->code[1].a;
-    }
-  } else if (p->n_groups == 0 && p->code_len == 6 &&
-      p->code[0].op == OP_SAVE && p->code[0].a == 0 &&
-      p->code[1].op == OP_SPLIT && p->code[1].a == 2 && p->code[1].b == 4 &&
-      p->code[2].op == OP_CLASS &&
-      p->code[3].op == OP_JMP && p->code[3].a == 1 &&
-      p->code[4].op == OP_SAVE && p->code[4].a == 1 &&
-      p->code[5].op == OP_MATCH) {
-    const struct sclass *cls = &p->classes[p->code[2].a];
-    if (cls->prop_pos || cls->prop_neg || !sclass_has_high_byte(cls)) {
-      p->simple_class_kind = 2;
-      p->simple_class_idx = p->code[2].a;
-    }
-  }
-  compute_simple_rune_repeat(p);
   compute_lazy_dfa(p);
 
-  /* Pre-allocate VM scratch buffers. */
-  p->vm_max_per_step = p->code_len * 2 + 8;
-  size_t thread_bytes = (size_t) p->vm_max_per_step * sizeof(struct thread);
-  size_t pool_ints = (size_t) p->vm_max_per_step * (size_t) p->n_save_slots;
-  p->vm_clist     = malloc(thread_bytes);
-  p->vm_nlist     = malloc(thread_bytes);
-  p->vm_pool_a    = (int *) malloc(pool_ints * sizeof(int));
-  p->vm_pool_b    = (int *) malloc(pool_ints * sizeof(int));
-  p->vm_seen_gen  = (int *) calloc((size_t) p->code_len, sizeof(int));
-  p->vm_best_caps = (int *) malloc((size_t) p->n_save_slots * sizeof(int));
-  p->vm_cap_ints  = (int *) malloc((size_t) p->n_save_slots * sizeof(int));
-  p->vm_th_a      = (int *) malloc((size_t) p->vm_max_per_step * sizeof(int));
-  p->vm_th_b      = (int *) malloc((size_t) p->vm_max_per_step * sizeof(int));
-  if (p->vm_clist == NULL || p->vm_nlist == NULL ||
-      p->vm_pool_a == NULL || p->vm_pool_b == NULL ||
-      p->vm_seen_gen == NULL || p->vm_best_caps == NULL ||
-      p->vm_cap_ints == NULL || p->vm_th_a == NULL || p->vm_th_b == NULL) {
+  /* One allocation for both VMs. Pointer-aligned thread lists come
+   * first, followed by int-aligned capture pools and generation data. */
+  if (p->code_len > (INT32_MAX - 8) / 2) {
     hfre_free(p);
     return HFRE_OUT_OF_MEMORY;
   }
+  p->vm_max_per_step = p->code_len * 2 + 8;
+  if (p->n_save_slots > INT32_MAX / p->vm_max_per_step) {
+    hfre_free(p);
+    return HFRE_OUT_OF_MEMORY;
+  }
+  size_t pool_ints = (size_t) p->vm_max_per_step * (size_t) p->n_save_slots;
+  if ((size_t) p->vm_max_per_step > SIZE_MAX / sizeof(struct thread) ||
+      pool_ints > SIZE_MAX / sizeof(int)) {
+    hfre_free(p);
+    return HFRE_OUT_OF_MEMORY;
+  }
+  size_t thread_bytes = (size_t) p->vm_max_per_step * sizeof(struct thread);
+  size_t pool_bytes = pool_ints * sizeof(int);
+  size_t cap_bytes = (size_t) p->n_save_slots * sizeof(int);
+  size_t sizes[] = { thread_bytes, thread_bytes, pool_bytes, pool_bytes,
+                    (size_t) p->code_len * sizeof(int), cap_bytes, cap_bytes };
+  size_t total = 0;
+  for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++) {
+    if (sizes[i] > SIZE_MAX - total) {
+      hfre_free(p);
+      return HFRE_OUT_OF_MEMORY;
+    }
+    total += sizes[i];
+  }
+  p->vm_scratch = malloc(total);
+  if (p->vm_scratch == NULL) {
+    hfre_free(p);
+    return HFRE_OUT_OF_MEMORY;
+  }
+  unsigned char *scratch = (unsigned char *) p->vm_scratch;
+  p->vm_clist = scratch;
+  p->vm_nlist = scratch + thread_bytes;
+  p->vm_th_a = (int *) p->vm_clist;
+  p->vm_th_b = (int *) p->vm_nlist;
+  int *ints = (int *) (scratch + 2 * thread_bytes);
+  p->vm_pool_a = ints; ints += pool_ints;
+  p->vm_pool_b = ints; ints += pool_ints;
+  p->vm_seen_gen = ints; ints += p->code_len;
+  p->vm_best_caps = ints; ints += p->n_save_slots;
+  p->vm_cap_ints = ints;
 
   *out = p;
   return 0;
@@ -3735,67 +3728,111 @@ static int run_pike(struct hfre *re, const unsigned char *buf,
 /* hfre_exec                                                           */
 /* ------------------------------------------------------------------ */
 
-static const unsigned char *icase_memchr(const unsigned char *hay, int hlen,
-                                          unsigned char needle_lo) {
-  unsigned char hi = ascii_upper(needle_lo);
-  for (int i = 0; i < hlen; i++) {
-    if (hay[i] == needle_lo || hay[i] == hi) return hay + i;
+/* Filter eight candidate positions at once using two literal bytes.
+ * memcpy keeps the word loads alignment/aliasing-safe;
+ * the zero-byte test works on either byte order and never reads beyond
+ * the supplied buffer. */
+static int find_lit_pairs_scalar(const unsigned char *buf, int last,
+                                 const unsigned char *lit, int n, int i,
+                                 int probe) {
+  const uint64_t ones = UINT64_C(0x0101010101010101);
+  const uint64_t high = UINT64_C(0x8080808080808080);
+  uint64_t first = ones * lit[0], second = ones * lit[probe];
+  while (i <= last - 7) {
+    uint64_t a, b;
+    memcpy(&a, buf + i, sizeof(a));
+    memcpy(&b, buf + i + probe, sizeof(b));
+    uint64_t different = (a ^ first) | (b ^ second);
+    if (((different - ones) & ~different & high) != 0) {
+      for (int k = 0; k < 8; k++) {
+        if (buf[i + k] == lit[0] && buf[i + k + probe] == lit[probe] &&
+            memcmp(buf + i + k, lit, (size_t) n) == 0) {
+          return i + k;
+        }
+      }
+    }
+    i += 8;
   }
-  return NULL;
+  for (; i <= last; i++) {
+    if (buf[i] == lit[0] && buf[i + probe] == lit[probe] &&
+        memcmp(buf + i, lit, (size_t) n) == 0) return i;
+  }
+  return -1;
+}
+
+#if HFRE_HAVE_AVX2
+__attribute__((target("avx2")))
+static int find_lit_pairs_avx2(const unsigned char *buf, int last,
+                              const unsigned char *lit, int n, int i,
+                              int probe) {
+  __m256i first = _mm256_set1_epi8((char) lit[0]);
+  __m256i second = _mm256_set1_epi8((char) lit[probe]);
+  while (i <= last - 31) {
+    __m256i a, b;
+    memcpy(&a, buf + i, sizeof(a));
+    memcpy(&b, buf + i + probe, sizeof(b));
+    unsigned mask = (unsigned) _mm256_movemask_epi8(_mm256_and_si256(
+      _mm256_cmpeq_epi8(a, first), _mm256_cmpeq_epi8(b, second)));
+    while (mask != 0) {
+      int k = __builtin_ctz(mask);
+      if (memcmp(buf + i + k, lit, (size_t) n) == 0) return i + k;
+      mask &= mask - 1;
+    }
+    i += 32;
+  }
+  return find_lit_pairs_scalar(buf, last, lit, n, i, probe);
+}
+#endif
+
+static int find_lit_pairs(const unsigned char *buf, int last,
+                          const unsigned char *lit, int n, int i) {
+  int probe = n - 1;
+  while (probe > 0 && lit[probe] == lit[0]) probe--;
+#if HFRE_HAVE_AVX2
+  if (last - i >= 63 && __builtin_cpu_supports("avx2")) {
+    return find_lit_pairs_avx2(buf, last, lit, n, i, probe);
+  }
+#endif
+  return find_lit_pairs_scalar(buf, last, lit, n, i, probe);
+}
+
+/* Stay with libc's vectorized scan while candidates are sparse. Move
+ * to the word filter only after several nearby false positives. Keep
+ * the uncommon path separate so short searches stay cheap to inline. */
+static inline int find_lit_candidates(const unsigned char *buf, int buf_len,
+                                      const unsigned char *lit, int n) {
+  if (n <= 0 || n > buf_len) return -1;
+  int last = buf_len - n;
+  int i = 0, dense = 0;
+  while (i <= last) {
+    const unsigned char *p = (const unsigned char *)
+      memchr(buf + i, lit[0], (size_t)(last - i + 1));
+    if (p == NULL) return -1;
+    int pos = (int)(p - buf);
+    if (memcmp(p, lit, (size_t) n) == 0) return pos;
+    dense = pos - i <= 32 ? dense + 1 : 0;
+    i = pos + 1;
+    if (dense == 4) return find_lit_pairs(buf, last, lit, n, i);
+  }
+  return -1;
 }
 
 static int find_pure_literal(const struct hfre *re,
                              const unsigned char *buf, int buf_len,
                              int *out_start) {
-  int icase = (re->flags & HFRE_IGNORE_CASE) != 0;
   int n = re->literal_len;
   if (n == 0) { *out_start = 0; return 0; }
   if (n > buf_len) return HFRE_NO_MATCH;
-
-  if (!icase) {
-    /* memchr+memcmp wins decisively over a scalar Shift-Or loop on
-     * realistic buffers because libc's memchr is vectorized; the
-     * Shift-Or path here was costing 4-8x on short literals in big
-     * buffers. Shift-Or remains compiled for callers who need
-     * worst-case-linear behavior, but find_pure_literal defaults to
-     * the faster memchr-and-verify scan. */
-    unsigned char first = re->literal[0];
-    int last = buf_len - n;
-    int i = 0;
-    while (i <= last) {
-      const unsigned char *p =
-        (const unsigned char *) memchr(buf + i, first, (size_t)(last - i + 1));
-      if (p == NULL) return HFRE_NO_MATCH;
-      i = (int) (p - buf);
-      if (memcmp(buf + i, re->literal, (size_t) n) == 0) {
-        *out_start = i;
-        return i + n;
-      }
-      i++;
-    }
-    return HFRE_NO_MATCH;
-  } else {
-    unsigned char first = re->literal[0];   /* lowercased */
-    int last = buf_len - n;
-    int i = 0;
-    while (i <= last) {
-      const unsigned char *p = icase_memchr(buf + i, last - i + 1, first);
-      if (p == NULL) return HFRE_NO_MATCH;
-      i = (int) (p - buf);
-      int ok = 1;
-      for (int j = 0; j < n; j++) {
-        unsigned char b = buf[i + j];
-        unsigned char lo = (unsigned char) ascii_lower((int) b);
-        if (lo != re->literal[j]) { ok = 0; break; }
-      }
-      if (ok) {
-        *out_start = i;
-        return i + n;
-      }
-      i++;
-    }
-    return HFRE_NO_MATCH;
+  if (re->anchored_bol) {
+    if (memcmp(buf, re->literal, (size_t) n) != 0) return HFRE_NO_MATCH;
+    *out_start = 0;
+    return n;
   }
+
+  int start = find_lit_candidates(buf, buf_len, re->literal, n);
+  if (start < 0) return HFRE_NO_MATCH;
+  *out_start = start;
+  return start + n;
 }
 
 /*
@@ -3819,16 +3856,7 @@ static int find_lit(const unsigned char *haystack, int hlen,
   }
   int last = hlen - nlen;
   if (nlen < 8) {
-    int i = 0;
-    while (i <= last) {
-      const unsigned char *p = (const unsigned char *)
-        memchr(haystack + i, needle[0], (size_t)(last - i + 1));
-      if (p == NULL) return -1;
-      i = (int)(p - haystack);
-      if (memcmp(haystack + i, needle, (size_t) nlen) == 0) return i;
-      i++;
-    }
-    return -1;
+    return find_lit_candidates(haystack, hlen, needle, nlen);
   }
   /* BMH for longer needles. */
   int i = 0;
@@ -3936,6 +3964,110 @@ static int class_match_at(const struct sclass *cls, int flags,
   return sclass_match(cls, flags, cp, buf[pos]);
 }
 
+#if HFRE_HAVE_AVX2
+/* Test an arbitrary ASCII bitmap with two byte shuffles. Non-ASCII
+ * bytes stop the scan so the caller can decode a complete UTF-8 rune. */
+__attribute__((target("avx2")))
+static int span_class_ascii_avx2(const struct sclass *cls,
+                                 const unsigned char *buf, int len,
+                                 int pos, int want_raw) {
+  __m128i table;
+  memcpy(&table, cls->ascii_lut, sizeof(table));
+  __m256i lut = _mm256_broadcastsi128_si256(table);
+  __m256i bits = _mm256_setr_epi8(
+    1, 2, 4, 8, 16, 32, 64, -128, 0, 0, 0, 0, 0, 0, 0, 0,
+    1, 2, 4, 8, 16, 32, 64, -128, 0, 0, 0, 0, 0, 0, 0, 0);
+  __m256i low = _mm256_set1_epi8(15);
+  __m256i zero = _mm256_setzero_si256();
+  while (pos <= len - 32) {
+    __m256i bytes;
+    memcpy(&bytes, buf + pos, sizeof(bytes));
+    __m256i hi = _mm256_and_si256(_mm256_srli_epi16(bytes, 4), low);
+    __m256i member = _mm256_and_si256(_mm256_shuffle_epi8(lut, bytes),
+                                     _mm256_shuffle_epi8(bits, hi));
+    unsigned absent = (unsigned) _mm256_movemask_epi8(
+      _mm256_cmpeq_epi8(member, zero));
+    unsigned stop = (want_raw ? absent : ~absent) |
+                    (unsigned) _mm256_movemask_epi8(bytes);
+    if (stop != 0) return pos + __builtin_ctz(stop);
+    pos += 32;
+  }
+  if (pos < len) {
+    /* Re-read the final in-bounds vector, masking already consumed
+     * lanes. This avoids up to 31 scalar bitmap checks at the tail. */
+    int tail = len - 32;
+    __m256i bytes;
+    memcpy(&bytes, buf + tail, sizeof(bytes));
+    __m256i hi = _mm256_and_si256(_mm256_srli_epi16(bytes, 4), low);
+    __m256i member = _mm256_and_si256(_mm256_shuffle_epi8(lut, bytes),
+                                     _mm256_shuffle_epi8(bits, hi));
+    unsigned absent = (unsigned) _mm256_movemask_epi8(
+      _mm256_cmpeq_epi8(member, zero));
+    unsigned stop = (want_raw ? absent : ~absent) |
+                    (unsigned) _mm256_movemask_epi8(bytes);
+    stop &= ~0u << (pos - tail);
+    if (stop != 0) return tail + __builtin_ctz(stop);
+  }
+  return len;
+}
+#endif
+
+/* Raw byte classes admitted by simple-repeat detection have no high
+ * bits. A positive bitmap lookup therefore also rejects non-ASCII. */
+static inline int span_class_ascii(const struct sclass *cls,
+                                   const unsigned char *buf, int len,
+                                   int pos, int want_raw) {
+  if (want_raw) {
+    while (pos < len && sclass_byte_raw(cls, buf[pos])) pos++;
+  } else {
+    while (pos < len && buf[pos] < 128 && !sclass_byte_raw(cls, buf[pos])) pos++;
+  }
+  return pos;
+}
+
+static int span_class_general(const struct sclass *cls, int flags,
+                               const unsigned char *buf, int len,
+                               int pos, int want) {
+  int byte_only = (cls->prop_pos == 0 && cls->prop_neg == 0);
+  int want_raw = want ^ cls->inverted;
+#if HFRE_HAVE_AVX2
+  int vectorize = byte_only && len - pos >= 64 &&
+                  __builtin_cpu_supports("avx2");
+#endif
+  while (pos < len) {
+    if (byte_only) {
+      /* An immediately differing byte needs no vector setup. */
+      if (buf[pos] < 128 && sclass_byte_raw(cls, buf[pos]) != want_raw) break;
+#if HFRE_HAVE_AVX2
+      if (vectorize && len - pos >= 64) {
+        pos = span_class_ascii_avx2(cls, buf, len, pos, want_raw);
+      } else
+#endif
+      {
+        pos = span_class_ascii(cls, buf, len, pos, want_raw);
+      }
+      if (pos == len || buf[pos] < 128) break;
+    }
+    int width;
+    if (class_match_at(cls, flags, buf, len, pos, &width) != want) break;
+    pos += width;
+  }
+  return pos;
+}
+
+static inline int span_class(const struct sclass *cls, int flags,
+                             const unsigned char *buf, int len,
+                             int pos, int want) {
+  if (cls->prop_pos || cls->prop_neg || len - pos >= 64) {
+    return span_class_general(cls, flags, buf, len, pos, want);
+  }
+  pos = span_class_ascii(cls, buf, len, pos, want ^ cls->inverted);
+  if (pos < len && buf[pos] >= 128) {
+    return span_class_general(cls, flags, buf, len, pos, want);
+  }
+  return pos;
+}
+
 static int dfa_byte_matches(const struct hfre *re, int pc, unsigned char b) {
   struct insn ins = re->code[pc];
   switch (ins.op) {
@@ -4020,7 +4152,7 @@ int hfre_exec(const struct hfre *re, const char *buf_, int buf_len,
     return end;
   }
 
-  if (re->suffix_lit_len > 0 && num_caps == 0) {
+  if (re->suffix_lit_len > 0) {
     if (buf_len < re->suffix_lit_len) return HFRE_NO_MATCH;
     int start = buf_len - re->suffix_lit_len;
     if (re->suffix_lit_full && start != 0) return HFRE_NO_MATCH;
@@ -4078,83 +4210,18 @@ int hfre_exec(const struct hfre *re, const char *buf_, int buf_len,
   /* Greedy single-class repeat fast path. */
   if (re->simple_class_kind != 0) {
     const struct sclass *cls = &re->classes[re->simple_class_idx];
-    int kind = re->simple_class_kind;  /* 1 plus, 2 star */
-    /* Pure-byte fast path: when the class has no Unicode property
-     * tests, every match decision is a single bitmap lookup on the
-     * current byte. This dominates the icase-class workload and is
-     * the lion's share of the cost when [a-z]+ runs over a kilobyte
-     * of input. */
-    int byte_only = (cls->prop_pos == 0 && cls->prop_neg == 0);
-    if (byte_only) {
-      if (kind == 2) {
-        int j = 0;
-        if (cls->inverted) {
-          while (j < buf_len && !sclass_byte_raw(cls, (unsigned char) buf[j])) j++;
-        } else {
-          while (j < buf_len && sclass_byte_raw(cls, (unsigned char) buf[j])) j++;
-        }
-        if (result != NULL) {
-          result->start = 0; result->end = j; result->ncaps = 0;
-        }
-        return j;
-      }
-      /* kind == 1, [CLASS]+ */
-      int i = 0;
-      if (cls->inverted) {
-        while (i < buf_len && sclass_byte_raw(cls, (unsigned char) buf[i])) i++;
-        if (i >= buf_len) return HFRE_NO_MATCH;
-        int j = i;
-        while (j < buf_len && !sclass_byte_raw(cls, (unsigned char) buf[j])) j++;
-        if (result != NULL) {
-          result->start = i; result->end = j; result->ncaps = 0;
-        }
-        return j;
-      }
-      while (i < buf_len && !sclass_byte_raw(cls, (unsigned char) buf[i])) i++;
-      if (i >= buf_len) return HFRE_NO_MATCH;
-      int j = i;
-      while (j < buf_len && sclass_byte_raw(cls, (unsigned char) buf[j])) j++;
-      if (result != NULL) {
-        result->start = i; result->end = j; result->ncaps = 0;
-      }
-      return j;
+    int start = 0;
+    if (re->simple_class_kind == 1) {
+      start = span_class(cls, re->flags, buf, buf_len, 0, 0);
+      if (start == buf_len) return HFRE_NO_MATCH;
     }
-    if (kind == 2) {
-      /* [CLASS]* — leftmost match is at offset 0; greedy length is the
-       * longest run of in-class bytes from offset 0. */
-      int j = 0;
-      while (j < buf_len) {
-        int w;
-        if (!class_match_at(cls, re->flags, buf, buf_len, j, &w)) break;
-        j += w;
-      }
-      if (result != NULL) {
-        result->start = 0;
-        result->end = j;
-        result->ncaps = 0;
-      }
-      return j;
+    int end = span_class(cls, re->flags, buf, buf_len, start, 1);
+    if (result != NULL) {
+      result->start = start;
+      result->end = end;
+      result->ncaps = 0;
     }
-    /* kind == 1, [CLASS]+ — leftmost in-class byte starts the match. */
-    for (int i = 0; i < buf_len; ) {
-      int w;
-      if (class_match_at(cls, re->flags, buf, buf_len, i, &w)) {
-        int j = i + w;
-        while (j < buf_len) {
-          if (!class_match_at(cls, re->flags, buf, buf_len, j, &w)) break;
-          j += w;
-        }
-        if (result != NULL) {
-          result->start = i;
-          result->end = j;
-          result->ncaps = 0;
-        }
-        return j;
-      }
-      if (w <= 0) w = 1;
-      i += w;
-    }
-    return HFRE_NO_MATCH;
+    return end;
   }
 
   int min_len = re->min_match_len;

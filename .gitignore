@@ -3,6 +3,15 @@ actionplan.md
 # build artifacts
 unit_test
 unit_test_asan
+unit_test_scalar
+unit_test_asan_scalar
 bench
+bench_scalar
+allocation_test
+allocation_test_asan
+unit_test_release
+unit_test_native
+bench_release
+bench_native
 *.o
 *.plist

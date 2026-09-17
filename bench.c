@@ -10,6 +10,7 @@
  */
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
@@ -31,6 +32,9 @@ static char long_buf[16384];
 static int  long_buf_len;
 static char log_buf[8192];
 static int  log_buf_len;
+static char dense_buf[4096];
+static char sparse_buf[4096];
+static char number_buf[8192];
 static const char *http_req = " GET /index.html HTTP/1.0\r\n\r\n";
 static int  http_req_len;
 static const char *unicode_buf = "lorem ipsum dolor sit amet 🦀 consectetur";
@@ -39,7 +43,7 @@ static int  unicode_buf_len;
 /* Pre-compiled patterns. */
 static struct hfre *re_lit, *re_http, *re_icase, *re_anchored, *re_late,
                    *re_alt, *re_unicode, *re_class_repeat, *re_dot_error,
-                   *re_digits_abc, *re_anchored_lit;
+                   *re_digits_abc, *re_anchored_lit, *re_notdigits;
 
 /* Each workload is a function returning an int that gets XOR'd into
  * the sink so the optimizer cannot delete the call. */
@@ -66,10 +70,26 @@ static int w_exec_class(int i)      { (void) i; return hfre_exec(re_class_repeat
 static int w_exec_dot_error(int i)  { (void) i; return hfre_exec(re_dot_error, log_buf, log_buf_len, NULL, 0, NULL); }
 static int w_exec_digits_abc(int i) { (void) i; return hfre_exec(re_digits_abc, big_buf, big_buf_len, NULL, 0, NULL); }
 static int w_exec_anchored_lit(int i) { (void) i; return hfre_exec(re_anchored_lit, "GET /", 5, NULL, 0, NULL); }
+static int w_exec_dense_miss(int i) { (void) i; return hfre_exec(re_lit, dense_buf, (int) sizeof(dense_buf), NULL, 0, NULL); }
+static int w_exec_sparse_miss(int i) { (void) i; return hfre_exec(re_lit, sparse_buf, (int) sizeof(sparse_buf), NULL, 0, NULL); }
+static int w_exec_early_lit(int i)  { (void) i; return hfre_exec(re_lit, "needle at the start", 19, NULL, 0, NULL); }
+static int w_exec_class_large(int i) { (void) i; return hfre_exec(re_class_repeat, long_buf, long_buf_len, NULL, 0, NULL); }
+static int w_exec_class_miss(int i) { (void) i; return hfre_exec(re_icase, number_buf, (int) sizeof(number_buf) - 3, NULL, 0, NULL); }
+static int w_exec_class_late(int i) { (void) i; return hfre_exec(re_icase, number_buf, (int) sizeof(number_buf), NULL, 0, NULL); }
+static int w_exec_inverted(int i) { (void) i; return hfre_exec(re_notdigits, upper_buf, upper_buf_len, NULL, 0, NULL); }
 
-static void run(const char *label, int iters, work_fn fn) {
+static void run(const char *label, int iters, work_fn fn, int expected) {
   struct timespec t0, t1;
   int acc = 0;
+  /* Check results and warm up code, data, and lazy DFA transitions. */
+  for (int i = 0; i < 32; i++) {
+    int actual = fn(i);
+    if (actual != expected) {
+      fprintf(stderr, "%s: expected %d, got %d\n", label, expected, actual);
+      exit(EXIT_FAILURE);
+    }
+    acc ^= actual;
+  }
   clock_gettime(CLOCK_MONOTONIC, &t0);
   for (int i = 0; i < iters; i++) acc ^= fn(i);
   clock_gettime(CLOCK_MONOTONIC, &t1);
@@ -78,7 +98,21 @@ static void run(const char *label, int iters, work_fn fn) {
          label, elapsed_ns(t0, t1) / iters, iters);
 }
 
-int main(void) {
+static void compile(const char *pattern, int flags, struct hfre **out) {
+  int err = hfre_compile(pattern, flags, out);
+  if (err != 0) {
+    fprintf(stderr, "Cannot compile %s: %d\n", pattern, err);
+    exit(EXIT_FAILURE);
+  }
+}
+
+int main(int argc, char **argv) {
+  int exec_only = argc == 2 && strcmp(argv[1], "--exec-only") == 0;
+  if (argc > 1 && !exec_only) {
+    fprintf(stderr, "Usage: %s [--exec-only]\n", argv[0]);
+    return EXIT_FAILURE;
+  }
+  setvbuf(stdout, NULL, _IOLBF, 0);
   /* big_buf: 4096 bytes of "abc..." with "needle" placed late. */
   for (int i = 0; i < (int) sizeof(big_buf); i++) {
     big_buf[i] = (char) ('a' + (i % 23));
@@ -105,43 +139,57 @@ int main(void) {
   }
   memcpy(log_buf + sizeof(log_buf) - 24, "fatal error: boom", 17);
   log_buf_len = (int) sizeof(log_buf);
+  memset(dense_buf, 'n', sizeof(dense_buf));
+  memset(sparse_buf, 'x', sizeof(sparse_buf));
+  memset(number_buf, '7', sizeof(number_buf));
+  memcpy(number_buf + sizeof(number_buf) - 3, "abc", 3);
 
   http_req_len = (int) strlen(http_req);
   unicode_buf_len = (int) strlen(unicode_buf);
 
-  hfre_compile("needle", 0, &re_lit);
-  hfre_compile("^\\s*(\\S+)\\s+(\\S+)\\s+HTTP/(\\d)\\.(\\d)", 0, &re_http);
-  hfre_compile("[a-z]+", HFRE_IGNORE_CASE, &re_icase);
-  hfre_compile("^(a*)CONTROL", 0, &re_anchored);
-  hfre_compile("zzz[0-9]+", 0, &re_late);
-  hfre_compile("(GET|POST|PUT|DELETE)", 0, &re_alt);
-  hfre_compile("🦀", 0, &re_unicode);
-  hfre_compile("[A-Za-z0-9_]+", 0, &re_class_repeat);
-  hfre_compile(".*error", 0, &re_dot_error);
-  hfre_compile("[0-9]+abc", 0, &re_digits_abc);
-  hfre_compile("^GET ", 0, &re_anchored_lit);
+  compile("needle", 0, &re_lit);
+  compile("^\\s*(\\S+)\\s+(\\S+)\\s+HTTP/(\\d)\\.(\\d)", 0, &re_http);
+  compile("[a-z]+", HFRE_IGNORE_CASE, &re_icase);
+  compile("^(a*)CONTROL", 0, &re_anchored);
+  compile("zzz[0-9]+", 0, &re_late);
+  compile("(GET|POST|PUT|DELETE)", 0, &re_alt);
+  compile("🦀", 0, &re_unicode);
+  compile("[A-Za-z0-9_]+", 0, &re_class_repeat);
+  compile(".*error", 0, &re_dot_error);
+  compile("[0-9]+abc", 0, &re_digits_abc);
+  compile("^GET ", 0, &re_anchored_lit);
+  compile("[^0-9]+", 0, &re_notdigits);
 
-  printf("=== hfre_match (compile every call) ===\n");
-  run("literal 'needle' in 4KB",          200000, w_match_lit);
-  run("HTTP request capture",             500000, w_match_http);
-  run("[a-z]+ icase 1KB upper",           200000, w_match_icase);
-  run("^(a*)CONTROL on CONTROL",         1000000, w_match_anchored);
-  run("zzz[0-9]+ late in 16KB",           100000, w_match_late);
-  run("(GET|POST|PUT|DELETE)",           1000000, w_match_alt);
-  run("UTF-8 emoji literal",             1000000, w_match_unicode);
+  if (!exec_only) {
+    printf("=== hfre_match (compile every call) ===\n");
+    run("literal 'needle' in 4KB",          200000, w_match_lit, 4086);
+    run("HTTP request capture",             500000, w_match_http, http_req_len - 4);
+    run("[a-z]+ icase 1KB upper",           200000, w_match_icase, upper_buf_len);
+    run("^(a*)CONTROL on CONTROL",         1000000, w_match_anchored, 7);
+    run("zzz[0-9]+ late in 16KB",           100000, w_match_late, 16008);
+    run("(GET|POST|PUT|DELETE)",           1000000, w_match_alt, 5);
+    run("UTF-8 emoji literal",             1000000, w_match_unicode, 31);
+  }
 
   printf("\n=== hfre_exec (compile once) ===\n");
-  run("literal 'needle' in 4KB",         1000000, w_exec_lit);
-  run("HTTP request capture",            1000000, w_exec_http);
-  run("[a-z]+ icase 1KB upper",           500000, w_exec_icase);
-  run("^(a*)CONTROL on CONTROL",         2000000, w_exec_anchored);
-  run("zzz[0-9]+ late in 16KB",           200000, w_exec_late);
-  run("(GET|POST|PUT|DELETE)",           2000000, w_exec_alt);
-  run("UTF-8 emoji literal",             2000000, w_exec_unicode);
-  run("[A-Za-z0-9_]+ on words",          1000000, w_exec_class);
-  run(".*error in 8KB log",              200000, w_exec_dot_error);
-  run("[0-9]+abc in 4KB",                500000, w_exec_digits_abc);
-  run("anchored ^GET ",                  2000000, w_exec_anchored_lit);
+  run("literal 'needle' in 4KB",         1000000, w_exec_lit, 4086);
+  run("HTTP request capture",            1000000, w_exec_http, http_req_len - 4);
+  run("[a-z]+ icase 1KB upper",           500000, w_exec_icase, upper_buf_len);
+  run("^(a*)CONTROL on CONTROL",         2000000, w_exec_anchored, 7);
+  run("zzz[0-9]+ late in 16KB",           200000, w_exec_late, 16008);
+  run("(GET|POST|PUT|DELETE)",           2000000, w_exec_alt, 5);
+  run("UTF-8 emoji literal",             2000000, w_exec_unicode, 31);
+  run("[A-Za-z0-9_]+ on words",          1000000, w_exec_class, 10);
+  run(".*error in 8KB log",              200000, w_exec_dot_error, 8179);
+  run("[0-9]+abc in 4KB",                500000, w_exec_digits_abc, HFRE_NO_MATCH);
+  run("anchored ^GET ",                  2000000, w_exec_anchored_lit, 4);
+  run("literal miss, dense first bytes",  200000, w_exec_dense_miss, HFRE_NO_MATCH);
+  run("literal miss, sparse first bytes", 1000000, w_exec_sparse_miss, HFRE_NO_MATCH);
+  run("literal at start",               2000000, w_exec_early_lit, 6);
+  run("[A-Za-z0-9_]+ in 16KB",            200000, w_exec_class_large, long_buf_len);
+  run("[a-z]+ icase miss in 8KB digits",  200000, w_exec_class_miss, HFRE_NO_MATCH);
+  run("[a-z]+ icase late in 8KB digits",  200000, w_exec_class_late, (int) sizeof(number_buf));
+  run("[^0-9]+ in 1KB upper",            500000, w_exec_inverted, upper_buf_len);
 
   hfre_free(re_lit);
   hfre_free(re_http);
@@ -154,6 +202,7 @@ int main(void) {
   hfre_free(re_dot_error);
   hfre_free(re_digits_abc);
   hfre_free(re_anchored_lit);
+  hfre_free(re_notdigits);
 
   printf("\n(sink=%d)\n", sink);
   return 0;

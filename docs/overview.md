@@ -27,14 +27,26 @@ subset of Perl-style syntax with UTF-8 support. Highlights:
   pure-literal extraction, suffix-literal checks, simple greedy
   rune/class-repeat shape detection, single-byte and small-set
   first-byte filters, literal-run and repeat bytecode opcodes,
-  top-level multi-literal filters, Shift-Or for short fixed strings,
+  top-level multi-literal filters, adaptive literal scanning,
   a bounded lazy-DFA reject cache for eligible no-capture ASCII
   bytecode, and a dominator-based required-literal scan
-  (Boyer-Moore-Horspool / memchr-and-verify hybrid). For the common
+  (Boyer-Moore-Horspool / memchr with a word-at-a-time or AVX2 filter
+  when first-byte candidates are dense). For the common
   shape `.*LIT` (greedy) and `.*?LIT` (lazy) the engine answers
   directly from the literal search without entering the VM at all.
-* Match-time scratch buffers are pre-allocated at compile time, so
-  `hfre_exec` is malloc-free on the hot path.
+* Runtime AVX2 dispatch on x86 GCC/Clang accelerates long ASCII class
+  repeats and dense literal searches on capable Intel and AMD CPUs.
+  A portable fallback is always available (`HFRE_DISABLE_SIMD` forces it).
+  Vector loads stay inside the supplied buffer; class scans stop at
+  non-ASCII bytes for UTF-8 decoding and Unicode folding.
+* Case-sensitive literal-only patterns, optionally anchored with `^`
+  and/or `$`, and simple greedy rune/class repeats skip VM allocation
+  and unrelated compile-time analyses.
+  Case-insensitive class analysis traverses the Unicode fold table
+  once per class. ASCII folding avoids Unicode table searches.
+* Needed match-time scratch buffers share one arena, and Thompson/Pike
+  thread lists reuse storage because the VMs execute separately. DFA
+  transition indices use one signed byte. `hfre_exec` is allocation-free.
 * Explicit unmatched-capture initialization to `{ NULL, 0 }`.
 * No dependency outside libc; portable C23 with `-pedantic-errors`.
 
@@ -43,4 +55,6 @@ log lines, and user input where bringing in a heavier library like
 PCRE2 is overkill.
 
 A `struct hfre` is **not** thread-safe (it owns scratch buffers used
-by the VM). Use one compiled regex per thread.
+by the VM and a mutable DFA cache). Use one compiled regex per thread
+when processing independent inputs in parallel. See
+[performance notes](performance.md) for build profiles and measurements.

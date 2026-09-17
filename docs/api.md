@@ -30,8 +30,10 @@ void hfre_free(struct hfre *re);
 ```
 
 `hfre_compile` parses the pattern, builds bytecode, and pre-allocates
-the VM scratch buffers. The returned object is **not thread-safe**:
-use one `struct hfre` per thread.
+any needed VM scratch buffers in one arena. Case-sensitive literal-only
+patterns and simple greedy rune/class repeats skip this scratch allocation.
+Execution performs no allocations. The returned object is **not thread-safe**:
+use one `struct hfre` per thread; VM scratch and the lazy DFA cache are mutable.
 
 `hfre_exec` searches `buf[0..buf_len)` for the first match. On
 success it returns the byte offset just past the match (also written

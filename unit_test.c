@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -45,6 +46,168 @@ static char *hfre_replace(const char *regex, const char *buf,
   } while (len > 0);
 
   return s;
+}
+
+/* Independent byte-search oracle for the adaptive literal scanner. */
+static void check_literal_scan(const struct hfre *re, const char *buf, int len,
+                                const char *literal, int literal_len) {
+  int expected = -1;
+  for (int i = 0; i <= len - literal_len; i++) {
+    if (memcmp(buf + i, literal, (size_t) literal_len) == 0) {
+      expected = i;
+      break;
+    }
+  }
+  struct hfre_result res;
+  int end = hfre_exec(re, buf, len, NULL, 0, &res);
+  ASSERT(expected < 0 ? end == HFRE_NO_MATCH :
+         end == expected + literal_len &&
+         res.start == expected && res.end == end && res.ncaps == 0);
+}
+
+/* Exact-sized allocations let ASAN catch reads past each input end. */
+static void test_literal_scans(void) {
+  static const struct {
+    const char *pattern;
+    const char *literal;
+    int len;
+  } cases[] = {
+    { "a", "a", 1 }, { "ab", "ab", 2 }, { "needle", "needle", 6 },
+    { "aaaab", "aaaab", 5 }, { "ababa", "ababa", 5 },
+    { "aaaa", "aaaa", 4 }, { "🦀", "🦀", 4 },
+    { "\\x00a", "\0a", 2 }, { "a\\x00b", "a\0b", 3 },
+    { "\\x00\\x01a", "\0\1a", 3 }
+  };
+  for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+    struct hfre *re = NULL;
+    ASSERT(hfre_compile(cases[c].pattern, 0, &re) == 0);
+    if (re == NULL) continue;
+    for (int align = 0; align < 32; align++) {
+      for (int len = 0; len <= 96; len++) {
+        char *storage = malloc((size_t)(align + len + (len == 0)));
+        ASSERT(storage != NULL);
+        if (storage == NULL) continue;
+        char *buf = storage + align;
+        int last = len >= cases[c].len ? len - cases[c].len : -1;
+        for (int pos = -1; pos <= last; pos++) {
+          memset(buf, cases[c].literal[0], (size_t) len);
+          if (pos >= 0) {
+            memcpy(buf + pos, cases[c].literal, (size_t) cases[c].len);
+          }
+          check_literal_scan(re, buf, len, cases[c].literal, cases[c].len);
+        }
+        free(storage);
+      }
+    }
+    /* Mixed candidate bytes exercise pair-filter collisions and the
+     * zero-byte arithmetic with NULs, high bits, and adjacent values. */
+    uint32_t rng = 1;
+    for (int trial = 0; trial < 512; trial++) {
+      char buf[128];
+      for (size_t i = 0; i < sizeof(buf); i++) {
+        rng = rng * UINT32_C(1664525) + UINT32_C(1013904223);
+        buf[i] = (trial & 1) ? (char)(rng >> 24) :
+          cases[c].literal[(rng >> 16) % (unsigned) cases[c].len];
+      }
+      if (trial % 3 != 0) {
+        int pos = trial % ((int) sizeof(buf) - cases[c].len + 1);
+        memcpy(buf + pos, cases[c].literal, (size_t) cases[c].len);
+      }
+      check_literal_scan(re, buf, (int) sizeof(buf), cases[c].literal, cases[c].len);
+    }
+    hfre_free(re);
+  }
+
+  /* Long needles, overlapping candidates, and an exact end-of-buffer hit. */
+  for (int n = 63; n <= 321; n++) {
+    char pattern[322], buf[512];
+    memset(pattern, 'a', (size_t) n);
+    pattern[n / 2] = 'b';
+    pattern[n] = '\0';
+    memset(buf, 'a', sizeof(buf));
+    struct hfre *re = NULL;
+    struct hfre_result res;
+    ASSERT(hfre_compile(pattern, 0, &re) == 0);
+    ASSERT(hfre_exec(re, buf, (int) sizeof(buf), NULL, 0, NULL) == HFRE_NO_MATCH);
+    memcpy(buf + sizeof(buf) - n, pattern, (size_t) n);
+    ASSERT(hfre_exec(re, buf, (int) sizeof(buf), NULL, 0, &res) ==
+           (int) sizeof(buf));
+    ASSERT(res.start == (int) sizeof(buf) - n);
+    hfre_free(re);
+  }
+}
+
+/* Capturing the same class forces the Pike VM, an independent oracle
+ * for the scalar/SIMD repeat shortcut, including UTF-8 fallback. */
+static void check_class_scan(const struct hfre *fast, const struct hfre *vm,
+                              const char *buf, int len) {
+  struct hfre_result a, b;
+  struct hfre_cap unused = { "stale", 5 }, cap;
+  int x = hfre_exec(fast, buf, len, &unused, 1, &a);
+  int y = hfre_exec(vm, buf, len, &cap, 1, &b);
+  ASSERT(x == y);
+  ASSERT(unused.ptr == NULL && unused.len == 0);
+  if (x >= 0 && y >= 0) {
+    ASSERT(a.start == b.start && a.end == b.end);
+    ASSERT(a.ncaps == 0 && cap.ptr == buf + a.start && cap.len == x - a.start);
+  }
+}
+
+static void test_class_scans(void) {
+  static const char *patterns[] = {
+    "[a-z]+", "[a-z]*", "[^a-z]+", "[^a-z]*", "[A-Za-z0-9_]+",
+    "[\\x00-\\x1f\\x7f]+", "[!#%&,.:;=]+", "\\s+", "\\S+",
+    "\\d+", "\\w+", "[\\p{Greek}a-z]+"
+  };
+  static const char *runes[] = { "K", "ſ", "é", "Σ", "🦀", "\xc0", "\x80" };
+  for (size_t p = 0; p < sizeof(patterns) / sizeof(patterns[0]); p++) {
+    for (int flags = 0; flags <= HFRE_IGNORE_CASE; flags++) {
+      char wrapped[80];
+      snprintf(wrapped, sizeof(wrapped), "(%s)", patterns[p]);
+      struct hfre *fast = NULL, *vm = NULL;
+      ASSERT(hfre_compile(patterns[p], flags, &fast) == 0);
+      ASSERT(hfre_compile(wrapped, flags, &vm) == 0);
+      if (fast == NULL || vm == NULL) {
+        hfre_free(fast);
+        hfre_free(vm);
+        continue;
+      }
+      /* Every ASCII byte, all alignments, and every vector-tail length.
+       * An exact allocation boundary exposes any vector over-read. */
+      for (int trial = 0; trial < 256; trial++) {
+        int len = 128 + trial % 33, align = trial % 32;
+        char *storage = malloc((size_t)(align + len));
+        ASSERT(storage != NULL);
+        if (storage == NULL) continue;
+        char *buf = storage + align;
+        memset(buf, trial & 127, (size_t) len);
+        check_class_scan(fast, vm, buf, len);
+        buf[trial % len] = (trial & 1) ? 'a' : '!';
+        check_class_scan(fast, vm, buf, len);
+        free(storage);
+      }
+      /* Stop at each possible position, including the overlapping
+       * final vector and short inputs that stay on the scalar path. */
+      char buf[160];
+      for (int len = 0; len <= (int) sizeof(buf); len++) {
+        for (int pos = 0; pos < len; pos++) {
+          memset(buf, 'a', (size_t) len);
+          buf[pos] = '!';
+          check_class_scan(fast, vm, buf, len);
+        }
+      }
+      for (size_t r = 0; r < sizeof(runes) / sizeof(runes[0]); r++) {
+        for (int pos = 28; pos <= 132; pos++) {
+          memset(buf, 'a', sizeof(buf));
+          memcpy(buf + pos, runes[r], strlen(runes[r]));
+          check_class_scan(fast, vm, buf, (int) sizeof(buf));
+        }
+      }
+      check_class_scan(fast, vm, "", 0);
+      hfre_free(fast);
+      hfre_free(vm);
+    }
+  }
 }
 
 int main(void) {
@@ -466,8 +629,8 @@ int main(void) {
   }
 
   /* Remaining portable accelerator shapes preserve observable
-   * matching: suffix literals, multi-literal filters, Shift-Or pure
-   * literals, bounded DFA filtering, and simple rune repeats. */
+   * matching: suffix literals, multi-literal filters, pure literals,
+   * bounded DFA filtering, and simple rune repeats. */
   {
     struct hfre *re = NULL;
     struct hfre_result res;
@@ -598,6 +761,102 @@ int main(void) {
     const char nul_buf2[] = { 'x', '\0', 'y' };
     ASSERT(hfre_match("a.c", nul_buf1, 3, NULL, 0, 0) == 3);
     ASSERT(hfre_match("\\x00", nul_buf2, 3, NULL, 0, 0) == 2);
+  }
+
+  /* Literal-only compilation omits VM scratch. An unused capture array
+   * must still be cleared for all three literal anchor shapes. */
+  {
+    static const char *patterns[] = { "foo", "^foo", "foo$", "^foo$" };
+    for (size_t i = 0; i < sizeof(patterns) / sizeof(patterns[0]); i++) {
+      struct hfre *re = NULL;
+      struct hfre_result res;
+      struct hfre_cap c[2] = { { "stale", 5 }, { "stale", 5 } };
+      ASSERT(hfre_compile(patterns[i], 0, &re) == 0);
+      ASSERT(hfre_capture_count(re) == 0);
+      ASSERT(hfre_exec(re, "foo", 3, c, 2, &res) == 3);
+      ASSERT(res.start == 0 && res.end == 3 && res.ncaps == 0);
+      ASSERT(c[0].ptr == NULL && c[0].len == 0);
+      ASSERT(c[1].ptr == NULL && c[1].len == 0);
+      ASSERT(hfre_exec(re, "fo", 2, c, 2, NULL) == HFRE_NO_MATCH);
+      hfre_free(re);
+    }
+    ASSERT(hfre_match("^foo", "xfoo", 4, NULL, 0, 0) == HFRE_NO_MATCH);
+    ASSERT(hfre_match("^foo", "foobar", 6, NULL, 0, 0) == 3);
+    ASSERT(hfre_match("^🦀", "🦀!", 5, NULL, 0, 0) == 4);
+    ASSERT(hfre_match("^foo", "FOO", 3, NULL, 0, HFRE_IGNORE_CASE) == 3);
+    ASSERT(hfre_match("^foo|bar", "xbar", 4, NULL, 0, 0) == 4);
+    const char buf[] = { '\0', 'a', 'b' };
+    ASSERT(hfre_match("^\\x00a", buf, 3, NULL, 0, 0) == 2);
+  }
+
+  /* Class first-byte analysis must include reverse Unicode folds after
+   * changing from one fold-table traversal per byte to one per class. */
+  {
+    static const struct {
+      const char *pattern;
+      const char *input;
+    } cases[] = {
+      { "([a-z]x)", "Kx" }, { "([A-Z]x)", "ſx" },
+      { "([k]x)", "Kx" }, { "([s]x)", "ſx" },
+      { "([\\xE0]x)", "Àx" }
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+      struct hfre_cap c[1];
+      int len = (int) strlen(cases[i].input);
+      ASSERT(hfre_match(cases[i].pattern, cases[i].input, len, c, 1,
+                        HFRE_IGNORE_CASE) == len);
+      ASSERT(c[0].ptr == cases[i].input && c[0].len == len);
+    }
+  }
+
+  /* The same literal scanner also seeds the VM and handles lazy dot-star. */
+  {
+    char buf[128];
+    memset(buf, 'n', sizeof(buf));
+    memcpy(buf + 101, "needle42", 8);
+    struct hfre_cap c[1];
+    struct hfre_result res;
+    struct hfre *re = NULL;
+    ASSERT(hfre_compile("needle(\\d+)", 0, &re) == 0);
+    ASSERT(hfre_exec(re, buf, (int) sizeof(buf), c, 1, &res) == 109);
+    ASSERT(res.start == 101 && c[0].ptr == buf + 107 && c[0].len == 2);
+    hfre_free(re);
+    memcpy(buf + 120, "needle", 6);
+    ASSERT(hfre_match(".*?needle", buf, (int) sizeof(buf), NULL, 0, 0) == 107);
+    ASSERT(hfre_match(".*needle", buf, (int) sizeof(buf), NULL, 0, 0) == 126);
+  }
+
+  test_literal_scans();
+  test_class_scans();
+
+  /* The two VMs share list storage. Alternate capture/no-capture
+   * execution on the same object across successful and failed calls. */
+  {
+    static const char *patterns[] = {
+      "(a|ab)+c", "(a(b)|a(c))", "([a-z]+):(\\d+)", "(ab)[0-9]c",
+      "a[0-9]+b", "[a-z]+_[0-9]+"
+    };
+    static const char *inputs[] = {
+      "", "xxababc", "ac", "abc:123", "ab7c", "a123b", "word_456", "!"
+    };
+    for (size_t p = 0; p < sizeof(patterns) / sizeof(patterns[0]); p++) {
+      struct hfre *re = NULL;
+      ASSERT(hfre_compile(patterns[p], 0, &re) == 0);
+      for (int pass = 0; pass < 8; pass++) {
+        for (size_t i = 0; i < sizeof(inputs) / sizeof(inputs[0]); i++) {
+          int len = (int) strlen(inputs[i]);
+          struct hfre_cap expected[4], actual[4];
+          int end = hfre_match(patterns[p], inputs[i], len, expected, 4, 0);
+          ASSERT(hfre_exec(re, inputs[i], len, NULL, 0, NULL) == end);
+          ASSERT(hfre_exec(re, inputs[i], len, actual, 4, NULL) == end);
+          for (int k = 0; k < 4; k++) {
+            ASSERT(actual[k].ptr == expected[k].ptr &&
+                   actual[k].len == expected[k].len);
+          }
+        }
+      }
+      hfre_free(re);
+    }
   }
 
   /* Large alternation/capture pressure should stay inside VM scratch

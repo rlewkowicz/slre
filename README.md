@@ -16,9 +16,17 @@ and the engine guarantees no catastrophic backtracking.
   256-bit byte-class bitmaps, pure-literal extraction, simple
   greedy-class-repeat shape detection, single- and small-set
   first-byte filters, and a dominator-based required-literal scan
-  (Boyer-Moore-Horspool / `memchr`-and-verify hybrid).
-* Match-time scratch buffers are pre-allocated at compile time so
-  `hfre_exec` is malloc-free on the hot path.
+  (Boyer-Moore-Horspool / adaptive `memchr` and word-at-a-time filtering).
+* Runtime-dispatched AVX2 scans dense literal candidates and long ASCII
+  class repeats on supported Intel and AMD CPUs. Other CPUs use the
+  portable implementation; no global AVX compiler flag is required.
+* Case-sensitive literal-only patterns, including `^literal`, `literal$`, and
+  `^literal$`, and simple greedy rune/class repeats skip VM allocation
+  and unrelated compile-time analyses. Case-insensitive classes traverse
+  the Unicode fold table once per class.
+* VM scratch uses one arena, with storage shared between mutually exclusive
+  VMs. A compact bounded DFA cache uses byte-sized transition indices.
+  `hfre_exec` performs no allocations.
 * Builds clean under `-std=c23 -Wall -Wextra -pedantic-errors` and
   runs clean under `-fsanitize=address,undefined`.
 * No dependency outside libc.
@@ -28,40 +36,81 @@ and the engine guarantees no catastrophic backtracking.
 ```
 make             # builds unit_test
 make test        # runs the unit tests
-make bench       # builds the bench
-make run-bench   # runs the bench
-make asan        # builds + runs under ASAN/UBSAN (uses CC=clang or
-                 # libsan-equipped gcc)
+make test-scalar # tests with HFRE_DISABLE_SIMD
+make test-alloc  # allocation accounting and failure injection
+make bench       # builds bench with default -O2 flags
+make bench-scalar # builds bench_scalar with HFRE_DISABLE_SIMD
+make bench-release test-release # -O3 -flto, builds bench_release
+make bench-native test-native   # also -march=native, builds bench_native
+make asan CC=clang        # ASAN/UBSAN, including allocation tests
+make asan-scalar CC=clang # ASAN/UBSAN without SIMD
 make portable-syntax   # -std=c23 -pedantic-errors -fsyntax-only
 ```
 
+Release builds retain runtime CPU dispatch. Native builds target the
+build machine's instruction set; rebuild on the destination CPU when
+using that profile. Both profiles include `-fomit-frame-pointer`.
+`RELEASE_CFLAGS` and `NATIVE_CFLAGS` can be overridden independently.
+See [performance notes](docs/performance.md) for compiler experiments,
+memory usage, SIMD, and threading.
+
 # Benchmarks
 
-Nanoseconds per call, measured with `gcc-14 -O2 -std=c23` via
-`make run-bench`. `v1 baseline` is the original recursive
-backtracking engine for reference. `hfre_match` is the one-shot
-wrapper (recompiles per call); `hfre_exec` is the same engine called
-against a regex compiled once. Higher-frequency call sites should
-prefer the compiled API.
+Nanoseconds per call on an Intel Core i9-12900K, Linux, GCC 16.2.1,
+measured 2026-09-17. Results are medians of five runs per configuration,
+rotating configuration order and running serially with `taskset -c 2`.
+CPU 2 was verified as a **P-core** through Linux's `cpu_core` topology
+(CPUs 0–15; E-cores are 16–23). AVX2 was active in both builds.
 
-| Workload                | v1 baseline | hfre_match | hfre_exec | Δ vs v1 baseline |
-| ----------------------- | ----------: | ---------: | --------: | ---------------- |
-| literal needle in 4KB   |      63 990 |      3 520 |     2 251 | 28.4× faster     |
-| HTTP request capture    |       3 002 |      3 529 |     1 190 | 2.5× faster      |
-| [a-z]+ icase 1KB upper  |      23 597 |     45 941 |     1 093 | 21.6× faster     |
-| ^(a*)CONTROL on CONTROL |         197 |      1 591 |       157 | 1.3× faster      |
-| zzz[0-9]+ late in 16KB  |     234 760 |      3 341 |       548 | 428× faster      |
+**Release** uses `-std=c23 -O3 -flto -fomit-frame-pointer`.
+**Native** adds `-march=native`. These are current performance numbers,
+not measurements on AMD or a guarantee for other workloads.
 
-Workloads not present in the v1 bench:
+`hfre_match` recompiles on every call:
 
-| Workload                  | hfre_exec |
-| ------------------------- | --------: |
-| (GET\|POST\|PUT\|DELETE)  |       151 |
-| UTF-8 emoji 🦀            |        15 |
-| [A-Za-z0-9_]+ on words    |        21 |
-| .*error in 8KB log        |        18 |
-| [0-9]+abc in 4KB          |       801 |
-| anchored ^GET             |       101 |
+| Workload | Release (ns) | Native (ns) |
+| -------- | -----------: | ----------: |
+| literal needle in 4KB | 173.6 | 177.0 |
+| HTTP request capture | 984.6 | 919.6 |
+| [a-z]+ icase 1KB upper | 215.0 | 191.3 |
+| ^(a*)CONTROL on CONTROL | 518.0 | 508.0 |
+| zzz[0-9]+ late in 16KB | 822.6 | 838.1 |
+| (GET\|POST\|PUT\|DELETE) | 916.8 | 892.4 |
+| UTF-8 emoji 🦀 | 46.7 | 47.6 |
+
+`hfre_exec` reuses a compiled regex:
+
+| Workload | Release (ns) | Native (ns) |
+| -------- | -----------: | ----------: |
+| literal needle in 4KB | 109.8 | 109.9 |
+| HTTP request capture | 370.4 | 361.1 |
+| [a-z]+ icase 1KB upper | 25.3 | 25.3 |
+| ^(a*)CONTROL on CONTROL | 49.7 | 70.8 |
+| zzz[0-9]+ late in 16KB | 165.0 | 168.2 |
+| (GET\|POST\|PUT\|DELETE) | 46.7 | 49.8 |
+| UTF-8 emoji 🦀 | 5.8 | 5.7 |
+| [A-Za-z0-9_]+ on words | 7.8 | 7.9 |
+| .*error in 8KB log | 8.5 | 8.5 |
+| [0-9]+abc in 4KB | 246.5 | 248.6 |
+| anchored ^GET | 3.0 | 3.0 |
+| literal miss, dense first bytes | 108.8 | 112.4 |
+| literal miss, sparse first bytes | 23.6 | 24.1 |
+| literal at start | 6.3 | 6.0 |
+| [A-Za-z0-9_]+ in 16KB | 326.6 | 320.7 |
+| [a-z]+ icase miss in 8KB digits | 166.8 | 162.1 |
+| [a-z]+ icase late in 8KB digits | 171.0 | 169.3 |
+| [^0-9]+ in 1KB upper | 26.5 | 26.3 |
+
+The dense-miss case searches for `needle` in 4KB of `n`; the
+sparse-miss case uses 4KB of `x`. Buffers and compiled objects are reused,
+so these measurements reflect warm caches. Native tuning is workload
+dependent: it helps some compilation cases but slows the small
+`^(a*)CONTROL` execution case.
+
+Run `taskset -c 2 ./bench_release` on this machine, or choose a verified
+performance core on your machine. Add `--exec-only` for compiled matching.
+The harness checks compile and match results and warms each workload
+before timing. For frequent calls, prefer the compiled API.
 
 # License
 
