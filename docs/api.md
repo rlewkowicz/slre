@@ -34,6 +34,8 @@ any needed VM scratch buffers in one arena. Case-sensitive literal-only
 patterns and simple greedy rune/class repeats skip this scratch allocation.
 Execution performs no allocations. The returned object is **not thread-safe**:
 use one `struct hfre` per thread; VM scratch and the lazy DFA cache are mutable.
+On compilation failure, `*out` is unchanged. A failed bytecode allocation
+returns `HFRE_OUT_OF_MEMORY`; it never produces a successful partial pattern.
 
 `hfre_exec` searches `buf[0..buf_len)` for the first match. On
 success it returns the byte offset just past the match (also written

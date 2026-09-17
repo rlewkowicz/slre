@@ -1,7 +1,7 @@
 CC      ?= cc
 CSTD    ?= -std=c23
 RELEASE_CFLAGS ?= -O3 -flto -Wall -Wextra -fomit-frame-pointer
-CFLAGS  ?= $(RELEASE_CFLAGS)
+CFLAGS  ?= $(NATIVE_CFLAGS)
 LDFLAGS ?=
 NATIVE_CFLAGS  ?= $(RELEASE_CFLAGS) -march=native
 

@@ -67,10 +67,12 @@ static void *counted_realloc(void *ptr, size_t size) {
 #undef free
 
 static int failures;
+static const char *current_pattern;
 
 #define CHECK(expr) do { \
   if (!(expr)) { \
-    fprintf(stderr, "Allocation check failed at line %d: %s\n", __LINE__, #expr); \
+    fprintf(stderr, "Allocation check failed for %s (failure %zu), line %d: %s\n", \
+            current_pattern, fail_at, __LINE__, #expr); \
     failures++; \
   } \
 } while (0)
@@ -97,12 +99,16 @@ int main(void) {
     { "[\\p{Greek}]+", "ΣΣ!", 0, 4 },
     { "a[0-9]+b", "a123b", 0, 5 },
     { "(a(b)|a(c))", "ac", 0, 2 },
+    { "^(ab)[0-9](cd)[0-9](ef)[0-9](gh)ij$", "ab1cd2ef3ghij", 0, 13 },
+    { "aaaaaaaaaaaaaaa.", "aaaaaaaaaaaaaaab", 0, 16 },
+    { "aaaaaaaaaaaaaaa\\p{Greek}", "aaaaaaaaaaaaaaaΣ", 0, 17 },
     { "^\\s*(\\S+)\\s+(\\S+)\\s+HTTP/(\\d)\\.(\\d)",
       " GET /index.html HTTP/1.0\r\n\r\n", 0, 25 }
   };
   setvbuf(stdout, NULL, _IOLBF, 0);
   puts("Pattern                                       live bytes  peak bytes  alloc calls");
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    current_pattern = cases[i].pattern;
     allocation_calls = peak_bytes = fail_at = 0;
     struct hfre *re = NULL;
     int err = hfre_compile(cases[i].pattern, cases[i].flags, &re);
@@ -128,7 +134,7 @@ int main(void) {
         check_exec(re, cases[i].input, len, cases[i].expected);
         hfre_free(re);
       } else {
-        CHECK(err < 0 && re == sentinel);
+        CHECK(err == HFRE_OUT_OF_MEMORY && re == sentinel);
       }
       CHECK(live_bytes == 0);
     }

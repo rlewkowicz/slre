@@ -829,6 +829,82 @@ int main(void) {
   test_literal_scans();
   test_class_scans();
 
+  /* Folded first-byte sets also use the byte-search accelerator. Test
+   * both ASCII cases and Unicode folds after a long rejected prefix. */
+  {
+    static const struct {
+      const char *pattern;
+      const char *input;
+    } cases[] = {
+      { "([k]x)", "KX" }, { "([k]x)", "Kx" },
+      { "([s]x)", "ſX" }, { "(kx)", "KX" },
+      { "(sx)", "Sx" }, { "(5x)", "5X" }, { "(Σx)", "ςX" }
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+      char buf[4096];
+      int len = (int) strlen(cases[i].input);
+      memset(buf, '7', sizeof(buf));
+      memcpy(buf + sizeof(buf) - len, cases[i].input, (size_t) len);
+      struct hfre *re = NULL;
+      struct hfre_cap cap;
+      struct hfre_result res;
+      ASSERT(hfre_compile(cases[i].pattern, HFRE_IGNORE_CASE, &re) == 0);
+      ASSERT(hfre_exec(re, buf, (int) sizeof(buf), &cap, 1, &res) == (int) sizeof(buf));
+      ASSERT(res.start == (int) sizeof(buf) - len &&
+             cap.ptr == buf + sizeof(buf) - len && cap.len == len);
+      ASSERT(hfre_exec(re, buf, (int) sizeof(buf) - len, &cap, 1, NULL) == HFRE_NO_MATCH);
+      hfre_free(re);
+    }
+  }
+
+  /* Long required literals use a byte-sized skip table. Exercise
+   * lengths around its saturation boundary, including exact-end hits. */
+  {
+    static const int lengths[] = { 255, 256, 257, 511, 512, 513 };
+    for (size_t n = 0; n < sizeof(lengths) / sizeof(lengths[0]); n++) {
+      int len = lengths[n];
+      char pattern[516], literal[514], buf[1200];
+      memset(literal, 'a', (size_t) len);
+      literal[len - 1] = 'b';
+      literal[len] = '\0';
+      snprintf(pattern, sizeof(pattern), "(%s)", literal);
+      struct hfre *re = NULL;
+      ASSERT(hfre_compile(pattern, 0, &re) == 0);
+      if (re == NULL) continue;
+      struct hfre_cap cap;
+      struct hfre_result res;
+      memset(buf, 'x', sizeof(buf));
+      ASSERT(hfre_exec(re, buf, (int) sizeof(buf), &cap, 1, NULL) == HFRE_NO_MATCH);
+      /* False final-byte candidates followed by an overlapping hit. */
+      memset(buf, 'b', sizeof(buf));
+      memcpy(buf + 127, literal, (size_t) len);
+      ASSERT(hfre_exec(re, buf, (int) sizeof(buf), &cap, 1, &res) == 127 + len);
+      ASSERT(res.start == 127 && cap.ptr == buf + 127 && cap.len == len);
+      memset(buf, 'x', sizeof(buf));
+      memcpy(buf + sizeof(buf) - len, literal, (size_t) len);
+      ASSERT(hfre_exec(re, buf, (int) sizeof(buf), &cap, 1, &res) == (int) sizeof(buf));
+      ASSERT(res.start == (int) sizeof(buf) - len && cap.len == len);
+      hfre_free(re);
+    }
+  }
+
+  /* Several straight-line literal runs retain their capture boundaries
+   * when collapsed in one pass, including a literal after the last group. */
+  {
+    struct hfre *re = NULL;
+    struct hfre_cap c[4];
+    struct hfre_result res;
+    const char *input = "ab1cd2ef3ghij";
+    ASSERT(hfre_compile("^(ab)[0-9](cd)[0-9](ef)[0-9](gh)ij$", 0, &re) == 0);
+    ASSERT(hfre_exec(re, input, 13, c, 4, &res) == 13);
+    ASSERT(res.start == 0 && res.ncaps == 4);
+    for (int i = 0; i < 4; i++) {
+      ASSERT(c[i].ptr == input + i * 3 && c[i].len == 2);
+    }
+    ASSERT(hfre_exec(re, "ab1cd2ef3ghix", 13, c, 4, NULL) == HFRE_NO_MATCH);
+    hfre_free(re);
+  }
+
   /* The two VMs share list storage. Alternate capture/no-capture
    * execution on the same object across successful and failed calls. */
   {

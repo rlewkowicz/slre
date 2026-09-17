@@ -35,6 +35,7 @@ static int  log_buf_len;
 static char dense_buf[4096];
 static char sparse_buf[4096];
 static char number_buf[8192];
+static char icase_prefix_buf[8192];
 static const char *http_req = " GET /index.html HTTP/1.0\r\n\r\n";
 static int  http_req_len;
 static const char *unicode_buf = "lorem ipsum dolor sit amet 🦀 consectetur";
@@ -43,7 +44,8 @@ static int  unicode_buf_len;
 /* Pre-compiled patterns. */
 static struct hfre *re_lit, *re_http, *re_icase, *re_anchored, *re_late,
                    *re_alt, *re_unicode, *re_class_repeat, *re_dot_error,
-                   *re_digits_abc, *re_anchored_lit, *re_notdigits;
+                   *re_digits_abc, *re_anchored_lit, *re_notdigits,
+                   *re_fixed_caps, *re_long_required, *re_icase_prefix;
 
 /* Each workload is a function returning an int that gets XOR'd into
  * the sink so the optimizer cannot delete the call. */
@@ -57,6 +59,7 @@ static int w_match_anchored(int i)  { (void) i; return hfre_match("^(a*)CONTROL"
 static int w_match_late(int i)      { (void) i; return hfre_match("zzz[0-9]+", long_buf, long_buf_len, NULL, 0, 0); }
 static int w_match_alt(int i)       { (void) i; return hfre_match("(GET|POST|PUT|DELETE)", "x GET /foo", 10, NULL, 0, 0); }
 static int w_match_unicode(int i)   { (void) i; return hfre_match("🦀", unicode_buf, unicode_buf_len, NULL, 0, 0); }
+static int w_match_fixed_caps(int i) { (void) i; struct hfre_cap c[3]; return hfre_match("^(GET) (/index\\.html) (HTTP/1\\.0)$", http_req + 1, http_req_len - 5, c, 3, 0); }
 
 /* hfre_exec (compile once) workloads. */
 static int w_exec_lit(int i)        { (void) i; return hfre_exec(re_lit, big_buf, big_buf_len, NULL, 0, NULL); }
@@ -77,6 +80,10 @@ static int w_exec_class_large(int i) { (void) i; return hfre_exec(re_class_repea
 static int w_exec_class_miss(int i) { (void) i; return hfre_exec(re_icase, number_buf, (int) sizeof(number_buf) - 3, NULL, 0, NULL); }
 static int w_exec_class_late(int i) { (void) i; return hfre_exec(re_icase, number_buf, (int) sizeof(number_buf), NULL, 0, NULL); }
 static int w_exec_inverted(int i) { (void) i; return hfre_exec(re_notdigits, upper_buf, upper_buf_len, NULL, 0, NULL); }
+static int w_exec_fixed_caps(int i) { (void) i; struct hfre_cap c[3]; return hfre_exec(re_fixed_caps, http_req + 1, http_req_len - 5, c, 3, NULL); }
+static int w_exec_long_required(int i) { (void) i; return hfre_exec(re_long_required, long_buf, long_buf_len, NULL, 0, NULL); }
+static int w_exec_icase_prefix(int i) { (void) i; return hfre_exec(re_icase_prefix, icase_prefix_buf, (int) sizeof(icase_prefix_buf), NULL, 0, NULL); }
+static int w_exec_icase_prefix_miss(int i) { (void) i; return hfre_exec(re_icase_prefix, icase_prefix_buf, (int) sizeof(icase_prefix_buf) - 4, NULL, 0, NULL); }
 
 static void run(const char *label, int iters, work_fn fn, int expected) {
   struct timespec t0, t1;
@@ -143,6 +150,8 @@ int main(int argc, char **argv) {
   memset(sparse_buf, 'x', sizeof(sparse_buf));
   memset(number_buf, '7', sizeof(number_buf));
   memcpy(number_buf + sizeof(number_buf) - 3, "abc", 3);
+  memset(icase_prefix_buf, '7', sizeof(icase_prefix_buf));
+  memcpy(icase_prefix_buf + sizeof(icase_prefix_buf) - 4, "Kx", 4);
 
   http_req_len = (int) strlen(http_req);
   unicode_buf_len = (int) strlen(unicode_buf);
@@ -159,6 +168,14 @@ int main(int argc, char **argv) {
   compile("[0-9]+abc", 0, &re_digits_abc);
   compile("^GET ", 0, &re_anchored_lit);
   compile("[^0-9]+", 0, &re_notdigits);
+  compile("^(GET) (/index\\.html) (HTTP/1\\.0)$", 0, &re_fixed_caps);
+  char long_pattern[259];
+  long_pattern[0] = '(';
+  memset(long_pattern + 1, '0', 256);
+  long_pattern[257] = ')';
+  long_pattern[258] = '\0';
+  compile(long_pattern, 0, &re_long_required);
+  compile("(kx)", HFRE_IGNORE_CASE, &re_icase_prefix);
 
   if (!exec_only) {
     printf("=== hfre_match (compile every call) ===\n");
@@ -169,6 +186,7 @@ int main(int argc, char **argv) {
     run("zzz[0-9]+ late in 16KB",           100000, w_match_late, 16008);
     run("(GET|POST|PUT|DELETE)",           1000000, w_match_alt, 5);
     run("UTF-8 emoji literal",             1000000, w_match_unicode, 31);
+    run("fixed HTTP fields with captures",  500000, w_match_fixed_caps, http_req_len - 5);
   }
 
   printf("\n=== hfre_exec (compile once) ===\n");
@@ -190,6 +208,10 @@ int main(int argc, char **argv) {
   run("[a-z]+ icase miss in 8KB digits",  200000, w_exec_class_miss, HFRE_NO_MATCH);
   run("[a-z]+ icase late in 8KB digits",  200000, w_exec_class_late, (int) sizeof(number_buf));
   run("[^0-9]+ in 1KB upper",            500000, w_exec_inverted, upper_buf_len);
+  run("fixed HTTP fields with captures", 500000, w_exec_fixed_caps, http_req_len - 5);
+  run("256-byte required literal miss in 16KB", 20000, w_exec_long_required, HFRE_NO_MATCH);
+  run("icase kx late in 8KB (Kelvin)",     200000, w_exec_icase_prefix, (int) sizeof(icase_prefix_buf));
+  run("icase kx miss in 8KB digits",      200000, w_exec_icase_prefix_miss, HFRE_NO_MATCH);
 
   hfre_free(re_lit);
   hfre_free(re_http);
@@ -203,6 +225,9 @@ int main(int argc, char **argv) {
   hfre_free(re_digits_abc);
   hfre_free(re_anchored_lit);
   hfre_free(re_notdigits);
+  hfre_free(re_fixed_caps);
+  hfre_free(re_long_required);
+  hfre_free(re_icase_prefix);
 
   printf("\n(sink=%d)\n", sink);
   return 0;

@@ -1375,10 +1375,7 @@ static int sclass_match(const struct sclass *c, int flags,
 }
 
 static int sclass_has_high_byte(const struct sclass *c) {
-  for (int b = 128; b < 256; b++) {
-    if (sclass_byte_raw(c, (unsigned char) b)) return 1;
-  }
-  return 0;
+  return (c->bits[2] | c->bits[3]) != 0;
 }
 
 static inline void sclass_set(struct sclass *c, unsigned char b) {
@@ -1562,7 +1559,8 @@ static int alloc_class(struct hfre *p) {
   return idx;
 }
 
-static int alloc_litop(struct hfre *p, const unsigned char *s, int len) {
+/* Takes ownership of s on success; the caller retains it on failure. */
+static int adopt_litop(struct hfre *p, unsigned char *s, int len) {
   if (p->n_lits == p->lits_cap) {
     int cap = p->lits_cap == 0 ? 4 : p->lits_cap * 2;
     struct litop *n = (struct litop *)
@@ -1571,11 +1569,8 @@ static int alloc_litop(struct hfre *p, const unsigned char *s, int len) {
     p->lits = n;
     p->lits_cap = cap;
   }
-  unsigned char *copy = (unsigned char *) malloc((size_t) len);
-  if (copy == NULL) return HFRE_OUT_OF_MEMORY;
-  memcpy(copy, s, (size_t) len);
   int idx = p->n_lits++;
-  p->lits[idx].s = copy;
+  p->lits[idx].s = s;
   p->lits[idx].len = len;
   return idx;
 }
@@ -1989,6 +1984,13 @@ static int parse_atom(struct parser *ps, struct hfre *p) {
     }
   }
 
+  /* Every atom emits at least one instruction. Do not silently accept
+   * a dropped atom when a single-instruction emission cannot grow code. */
+  if (p->code_len == start_pc) {
+    ps->err = HFRE_OUT_OF_MEMORY;
+    return -1;
+  }
+
   /* Postfix quantifier? */
   int q = peek(ps);
   if (q == '*' || q == '+' || q == '?') {
@@ -2307,7 +2309,7 @@ static int max_len_dfs(const struct hfre *p, int pc, unsigned char *state,
 
 static void compute_match_bounds(struct hfre *p) {
   unsigned char *state = (unsigned char *) calloc((size_t) p->code_len, 1);
-  int *memo = (int *) calloc((size_t) p->code_len, sizeof(int));
+  int *memo = (int *) malloc((size_t) p->code_len * sizeof(int));
   if (state != NULL && memo != NULL) {
     int unbounded = 0;
     int max_len = max_len_dfs(p, 0, state, memo, &unbounded);
@@ -2315,26 +2317,18 @@ static void compute_match_bounds(struct hfre *p) {
       p->has_max_match_len = 1;
       p->max_match_len = max_len;
     }
+    /* The DFS memo is only read after its state is marked complete.
+     * Both buffers can then serve as reachability scratch. */
+    for (int pc = 0; pc < p->code_len; pc++) {
+      if (p->code[pc].op == OP_EOL &&
+          !reaches_match_skipping(p, pc, state, memo)) {
+        p->anchored_eol = 1;
+        break;
+      }
+    }
   }
   free(state);
   free(memo);
-
-  unsigned char *seen = (unsigned char *) malloc((size_t) p->code_len);
-  int *stack = (int *) malloc((size_t) p->code_len * sizeof(int));
-  if (seen == NULL || stack == NULL) {
-    free(seen);
-    free(stack);
-    return;
-  }
-  for (int pc = 0; pc < p->code_len; pc++) {
-    if (p->code[pc].op == OP_EOL &&
-        !reaches_match_skipping(p, pc, seen, stack)) {
-      p->anchored_eol = 1;
-      break;
-    }
-  }
-  free(seen);
-  free(stack);
 }
 
 static void compute_required_literal(struct hfre *p) {
@@ -2421,7 +2415,8 @@ static void compute_required_literal(struct hfre *p) {
     }
   }
   /* BMH bad-character shift table. */
-  for (int i = 0; i < 256; i++) p->bmh_skip[i] = (unsigned char) off;
+  int default_shift = off > 255 ? 255 : off;
+  for (int i = 0; i < 256; i++) p->bmh_skip[i] = (unsigned char) default_shift;
   for (int i = 0; i < off - 1; i++) {
     int shift = off - 1 - i;
     if (shift > 255) shift = 255;
@@ -2496,18 +2491,6 @@ static int encode_rune_run(const struct hfre *p, int start, int count,
   return 1;
 }
 
-static void patch_targets_after_delete(struct hfre *p, int delete_from,
-                                       int deleted) {
-  for (int i = 0; i < p->code_len; i++) {
-    if (p->code[i].op == OP_JMP) {
-      if (p->code[i].a >= delete_from) p->code[i].a -= deleted;
-    } else if (p->code[i].op == OP_SPLIT) {
-      if (p->code[i].a >= delete_from) p->code[i].a -= deleted;
-      if (p->code[i].b >= delete_from) p->code[i].b -= deleted;
-    }
-  }
-}
-
 static void compute_literal_run_opcodes(struct hfre *p) {
   /* OP_LIT advances by a byte run in one VM transition. Keep it to
    * straight-line programs so Pike's per-thread position handling
@@ -2518,28 +2501,12 @@ static void compute_literal_run_opcodes(struct hfre *p) {
     }
   }
 
-  if (p->code_len <= 0) return;
-  unsigned char *targeted = (unsigned char *) calloc((size_t) p->code_len, 1);
-  if (targeted == NULL) return;
-  for (int pc = 0; pc < p->code_len; pc++) {
-    if (p->code[pc].op == OP_JMP) {
-      if (p->code[pc].a >= 0 && p->code[pc].a < p->code_len) {
-        targeted[p->code[pc].a] = 1;
-      }
-    } else if (p->code[pc].op == OP_SPLIT) {
-      if (p->code[pc].a >= 0 && p->code[pc].a < p->code_len) {
-        targeted[p->code[pc].a] = 1;
-      }
-      if (p->code[pc].b >= 0 && p->code[pc].b < p->code_len) {
-        targeted[p->code[pc].b] = 1;
-      }
-    }
-  }
-
+  /* With no jumps or splits there are no targets to track or patch.
+   * Continue past each collapsed run instead of restarting the pass. */
   for (int pc = 0; pc < p->code_len; pc++) {
     if (p->code[pc].op != OP_RUNE) continue;
     int end = pc + 1;
-    while (end < p->code_len && p->code[end].op == OP_RUNE && !targeted[end]) {
+    while (end < p->code_len && p->code[end].op == OP_RUNE) {
       end++;
     }
     int count = end - pc;
@@ -2547,8 +2514,7 @@ static void compute_literal_run_opcodes(struct hfre *p) {
       unsigned char *bytes = NULL;
       int len = 0;
       if (encode_rune_run(p, pc, count, &bytes, &len)) {
-        int idx = alloc_litop(p, bytes, len);
-        free(bytes);
+        int idx = adopt_litop(p, bytes, len);
         if (idx >= 0) {
           int deleted = count - 1;
           p->code[pc].op = OP_LIT;
@@ -2558,16 +2524,14 @@ static void compute_literal_run_opcodes(struct hfre *p) {
           memmove(&p->code[pc + 1], &p->code[end],
                   (size_t)(p->code_len - end) * sizeof(p->code[0]));
           p->code_len -= deleted;
-          patch_targets_after_delete(p, end, deleted);
-          free(targeted);
-          compute_literal_run_opcodes(p);
-          return;
+          end = pc + 1;
+        } else {
+          free(bytes);
         }
       }
     }
     pc = end - 1;
   }
-  free(targeted);
 }
 
 static void compute_suffix_literal(struct hfre *p) {
@@ -3864,8 +3828,8 @@ static int find_lit(const unsigned char *haystack, int hlen,
     int j = nlen - 1;
     while (j >= 0 && haystack[i + j] == needle[j]) j--;
     if (j < 0) return i;
-    int shift = skip[haystack[i + nlen - 1]];
-    i += shift > 0 ? shift : 1;
+    /* Compilation saturates every shift to 1..255. */
+    i += skip[haystack[i + nlen - 1]];
   }
   return -1;
 }
@@ -4187,7 +4151,8 @@ int hfre_exec(const struct hfre *re, const char *buf_, int buf_len,
     return end;
   }
 
-  if (re->multi_lit_count > 0 && find_multi_lit(re, buf, buf_len, 0) < 0) {
+  if (!re->multi_lit_is_prefix && re->multi_lit_count > 0 &&
+      find_multi_lit(re, buf, buf_len, 0) < 0) {
     return HFRE_NO_MATCH;
   }
 
@@ -4241,7 +4206,6 @@ int hfre_exec(const struct hfre *re, const char *buf_, int buf_len,
 
   int ret = HFRE_NO_MATCH;
   int start_pos = 0;
-  int icase = (re->flags & HFRE_IGNORE_CASE) != 0;
 
   int p = 0;
   if (re->anchored_eol && re->has_max_match_len &&
@@ -4271,12 +4235,13 @@ int hfre_exec(const struct hfre *re, const char *buf_, int buf_len,
       int found = -1;
       const unsigned char *bp = buf + p;
       int remaining = last_start - p + 1;
-      if (re->first_byte_count == 1 && !icase) {
+      /* The compiled set already includes all case-folded lead bytes. */
+      if (re->first_byte_count == 1) {
         const unsigned char *q = (const unsigned char *)
           memchr(bp, re->single_first_byte, (size_t) remaining);
         if (q == NULL) break;
         found = (int)(q - buf);
-      } else if (re->first_byte_list_len > 0 && !icase) {
+      } else if (re->first_byte_list_len > 0) {
         /* Multi-memchr scan: search for each candidate byte and keep
          * the leftmost. We bound the second and subsequent searches
          * by the current best so they don't re-scan past it. */
